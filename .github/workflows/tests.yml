@@ -2,8 +2,10 @@ name: Python tests
 on: [push, pull_request]
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    # 固定镜像以保留 Python 3.8 支持，避免 latest 更新后缺少旧解释器。
+    runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
         python-version: ['3.8', '3.12']
     steps:
