@@ -1,0 +1,62 @@
+{
+  "defaults": {
+    "eds": "../motor.eds",
+    "interface": "socketcan",
+    "channel": "can0",
+    "bitrate": 1000000,
+    "encoder_counts_per_rev": 65536,
+    "expected_vendor_id": 768,
+    "expected_product_code": 17988,
+    "min_position_inc": -100000,
+    "max_position_inc": 100000,
+    "max_velocity_rpm": 30,
+    "max_acceleration_rps2": 10,
+    "position_tolerance_inc": 10,
+    "zero_velocity_tolerance_rpm": 0,
+    "standstill_duration_s": 0.05,
+    "sdo_timeout_s": 0.3,
+    "state_timeout_s": 3,
+    "motion_timeout_s": 30,
+    "poll_interval_s": 0.02,
+    "hardware_verified": false,
+    "absolute_reference_verified": false
+  },
+  "rpdo_number": 4,
+  "shared_cob_id": 1280,
+  "pdo_configuration_verified": false,
+  "axes": [
+    {
+      "name": "x",
+      "node_id": 1,
+      "motion": {
+        "target_inc": 1000,
+        "velocity_rpm": 1,
+        "acceleration_rps2": 1,
+        "deceleration_rps2": 1,
+        "relative": true
+      }
+    },
+    {
+      "name": "y",
+      "node_id": 2,
+      "motion": {
+        "target_inc": 2000,
+        "velocity_rpm": 1,
+        "acceleration_rps2": 1,
+        "deceleration_rps2": 1,
+        "relative": true
+      }
+    },
+    {
+      "name": "z",
+      "node_id": 3,
+      "motion": {
+        "target_inc": -1500,
+        "velocity_rpm": 1,
+        "acceleration_rps2": 1,
+        "deceleration_rps2": 1,
+        "relative": true
+      }
+    }
+  ]
+}

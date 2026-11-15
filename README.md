@@ -1,6 +1,6 @@
 # Kinco CANopen PP Python
 
-使用 Python，通过 CANopen SDO 控制 Kinco 伺服电机运行于 PP（Profile Position，轮廓位置）模式。包含中文注释、命令行示例、独立模拟器及虚拟 CAN 协议测试。
+使用 Python，通过 CANopen SDO/RPDO 控制 Kinco 伺服电机运行于 PP（Profile Position，轮廓位置）模式。支持单轴定位及三轴共同启动、共同时间规划，包含中文注释、命令行示例、模拟器及虚拟 CAN 协议测试。
 
 当前接入目标为 **iSMD60D-040-DQBK-AA000 + CANable，节点 1，1 Mbit/s**。已完成软件测试及一次实机正向 600 圈相对定位，详见[实机验证记录](docs/hardware-validation.md)。配置和机械运动范围须结合每次实机状态确认。
 
@@ -9,6 +9,7 @@
 ```text
 src/kinco_pp/        配置换算、SDO 通信、PP 控制、模拟器和命令行
 examples/pp_move.py  单次定位入口
+examples/three_axis_move.py  三轴定位入口
 config/             JSON 配置示例；本地 local*.json 不提交
 tests/              单元测试与 CANopen 虚拟总线测试
 motor.eds           原始 Kinco EDS
@@ -98,6 +99,49 @@ kinco-pp --config config/local.json --execute --absolute --target 2000
 
 Halt 是通信控制，不能代替硬件急停或 STO；通信断开或进程被强制终止时，软件无法保证停机。本实现没有自动配置驱动器通信丢失保护（手册 §9.4 的相关默认设置可能不处理断线），实机使用前需配置并验证现场保护。禁止用未确认停止方式的悬垂负载直接试运行。
 
+## 三轴同步运行
+
+三轴共用一条 CAN 总线。默认配置 `config/three_axis.example.json` 使用节点 1/2/3，三轴相对位移分别为 1000、2000、-1500 inc；这些是模拟示例，三轴实机尚未验证。
+
+```bash
+python -m pip install -e .
+python -m kinco_pp.group_cli
+# 安装后的等价命令与示例：
+kinco-pp-group --config config/three_axis.example.json
+python examples/three_axis_move.py
+```
+
+配置中的 `defaults` 是各轴共用的设备设置；`axes` 内的 `name`、`node_id`、`motion` 描述每个轴，也可覆盖共用设置，例如各自的 EDS、分辨率、软件运动范围和零速容差。每轴 `motion` 使用 `target_inc`、`velocity_rpm`、`acceleration_rps2`、`deceleration_rps2` 和 `relative`。三个节点 ID 必须不同，总线接口及波特率相同，且统一使用相对定位或绝对定位；绝对方式须逐轴确认原点。
+
+同步流程如下：
+
+1. 在任何轴使能前核对全部身份、目标和软件限值。
+2. 暂存各轴原 RPDO 配置，在预操作状态将指定槽位映射为同一 COB-ID 下的 16 位控制字 0x6040；配置后逐项回读。
+3. 三轴保持 Halt，逐轴进入 PP 并装载速度、加减速度和目标，确认全部就绪。
+4. **只发送一条共同 RPDO 帧**，三个轴响应同一 bit4 上升沿；再监控全部应答、状态和目标位置。
+5. 正常结束或任一轴异常时，全组请求 Halt，并向所有已开始使能的轴发送 SDO 暂停请求后逐轴确认停稳。一轴失败也继续处理其余轴；确认全组静止后恢复原 RPDO 配置，不写 EEPROM。无法确认停稳则保留映射并报告错误。
+
+此处的共同启动使用异步 RPDO（类型 254），不要求周期性 SYNC 主站。原理与[CANopen 官方 PDO 文档中的多设备共同启动示例](https://canopen.readthedocs.io/en/stable/pdo.html)一致；驱动器内部处理时刻仍有差异，不能据此承诺硬实时精度。
+
+为尽量同时到位，先按实际整数单位计算各轴最快梯形/三角轮廓，选最长时间作为共同时间。短时轴降低速度和加减速度，再按设备整数分辨率重新求解巡航速度、估算到达时差，参数不超过原请求上限。可在配置顶层设置 `"duration_s": 5.0` 指定更长共同时间；不可小于最快可行时间。零位移轴保持位置，不参与到达时间差计算。模型假设起终点静止，未补偿负载、反馈单位误差或驱动器动态差异；这是 PP 单段协调定位，连续轨迹插补需要另行实现。
+
+三轴命令会分别输出共同规划时间、量化后的模型时间差，以及轮询观察到的到达时间差。**模拟器不模拟机械时间，轮询结果也包含主机及 SDO 延迟，二者都不是三轴实机同步精度。**
+
+实机接入时，先复制配置并逐轴核对：
+
+```bash
+cp config/three_axis.example.json config/local.three_axis.json
+kinco-pp-group --config config/local.three_axis.json --inspect
+# 核对全部配置与 PDO 通道后才执行：
+kinco-pp-group --config config/local.three_axis.json --execute
+```
+
+- `rpdo_number` 默认 4，需确认三个从站的该槽位都可临时重映射。
+- `shared_cob_id` 默认 1280（0x500），需在整条总线上预留，其他节点与主站不能使用；代码检测组内其他 PDO 的冲突。
+- 完成上述确认后设置顶层 `pdo_configuration_verified: true`，并逐轴设置 `hardware_verified: true`；默认均为 `false`。
+- 若任一驱动器不支持映射或回读不一致，会在运动触发前失败并尝试恢复已改动配置。
+- 节点必须由当前程序独占控制；Halt 与通信异常的现场保护要求同单轴模式。
+
 ## 测试与开发
 
 ```bash
@@ -105,9 +149,9 @@ python -m unittest discover -s tests -v
 python -m compileall -q src examples tests
 ```
 
-测试使用标准库 `unittest`，覆盖换算、状态切换、PP 应答、重复相对运动、负坐标、旧到位位、超时、故障和中断清理。协议测试采用 `canopen.LocalNode` 与 `python-can` 的 `virtual` 后端，不访问 CANable。模拟结果不等同于真实电机验证。
+测试使用标准库 `unittest`，覆盖换算、状态切换、PP 应答、重复相对运动、负坐标、旧到位位、超时、故障和中断清理。三轴测试额外验证时间规划、单帧触发、节点重复/掉线、共享 COB-ID 冲突、部分映射失败回滚及全组暂停。协议测试采用 `canopen.LocalNode` 与 `python-can` 的 `virtual` 后端，不访问 CANable。模拟结果不等同于真实电机验证。
 
-模块和函数提供中文说明，关键步骤标明索引、位定义及单位。控制器同步执行，不支持并发控制同一节点或实时多轴插补。
+模块和函数提供中文说明，关键步骤标明索引、位定义及单位。保留单轴命令与 API；三轴使用 `ThreeAxisController`、`GroupSettings` 和 `CanopenGroupBus`。同一节点不得由多个控制器并发操作。
 
 通信库使用官方接口：[CANopen 网络与节点](https://canopen.readthedocs.io/en/stable/network.html)、[SDO 访问](https://canopen.readthedocs.io/en/stable/sdo.html)、[SocketCAN 配置](https://python-can.readthedocs.io/en/stable/interfaces/socketcan.html)。
 

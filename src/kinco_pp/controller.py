@@ -6,7 +6,7 @@
 
 import logging
 import time
-from typing import Callable
+from typing import Callable, Tuple
 
 from .model import Motion, Settings
 from .objects import (
@@ -143,14 +143,8 @@ class ProfilePositionController:
 
         self._wait(stationary, timeout, "速度与位置稳定")
 
-    def move(self, motion: Motion) -> int:
-        """执行一次定位并返回实际到位位置 inc；参数错误、超时或故障抛异常。
-
-        必须先 prepare。相对目标根据触发前静止位置计算；绝对定位要求已确认原点。
-        先在 Halt 下清除 bit4 并等待 bit12=0；目标写入后，以 bit4 上升沿
-        同时解除 Halt；等待 bit12=1 后清除 bit4，并等待 bit12=0。
-        到位必须同时满足 bit10 和实际位置容差，避免误用上一指令的到位标志。
-        """
+    def check_enabled(self) -> int:
+        """返回状态字并确认使能和 PP 模式；异常状态抛 DriveError，不发送指令。"""
         if not self.prepared:
             raise DriveError("必须先调用 prepare()")
         status = self._status()
@@ -158,6 +152,15 @@ class ProfilePositionController:
             raise DriveError(f"驱动器未使能，状态字=0x{status:04X}")
         if self.io.read(Object.MODE_DISPLAY) != PP_MODE:
             raise DriveError("驱动器已离开 PP 模式")
+        return status
+
+    def stage(self, motion: Motion) -> Tuple[int, int]:
+        """在 Halt 下装载目标及轮廓，返回 (绝对终点 inc, 基础控制字)。
+
+        必须先 prepare；校验失败抛 ValueError/DriveError。该方法不置 bit4，
+        单轴和多轴共用此阶段，避免三轴逐一调用 move 导致先后启动。
+        """
+        self.check_enabled()
         start = self.io.read(Object.ACTUAL_POSITION)
         end = motion.validate(self.settings, start)
         base = CW_ENABLE | (CW_RELATIVE if motion.relative else CW_CHANGE_IMMEDIATELY)
@@ -172,6 +175,15 @@ class ProfilePositionController:
                       self.settings.acceleration_raw(motion.deceleration_rps2))
         self.io.write(Object.TARGET_POSITION, motion.target_inc)
         LOG.info("PP %s定位：起点=%d，终点=%d inc", "相对" if motion.relative else "绝对", start, end)
+        return end, base
+
+    def move(self, motion: Motion) -> int:
+        """执行单次定位并返回实际位置 inc；故障、握手或到位超时抛异常。
+
+        装载后以 bit4 上升沿解除 Halt 并触发；bit12 应答后复位 bit4，
+        再等待应答清零。到位需同时满足 bit10 与实际位置容差。
+        """
+        end, base = self.stage(motion)
         self._control(base | CW_NEW_SETPOINT)
         self._wait(lambda status: bool(status & SW_SETPOINT_ACK),
                    self.settings.state_timeout_s, "新指令应答")
@@ -191,14 +203,22 @@ class ProfilePositionController:
         self._wait(reached, self.settings.motion_timeout_s, "目标到位")
         return self.io.read(Object.ACTUAL_POSITION)
 
+    def request_halt(self) -> None:
+        """仅发送 bit8 暂停请求，不等待；可先通知所有轴后统一确认停止。"""
+        if self.enable_started:
+            self._control((self.controlword & ~CW_NEW_SETPOINT) | CW_HALT)
+
+    def wait_halted(self) -> None:
+        """确认已请求暂停的轴持续静止，失败抛异常，不发送控制字。"""
+        if self.enable_started:
+            self._wait_standstill(self.settings.motion_timeout_s)
+            self.prepared = False
+
     def halt(self) -> None:
         """置 bit8 并等待暂停完成，保持当前使能状态，无返回值。
 
         §5.1.2.1、§5.7.3：Halt 不是 STO 或硬件急停；通信失败不能保证停机。
         暂停后联合确认 0x606C 低速与位置稳定；可能抛通信、故障或超时异常。
         """
-        if not self.enable_started:
-            return
-        self._control((self.controlword & ~CW_NEW_SETPOINT) | CW_HALT)
-        self._wait_standstill(self.settings.motion_timeout_s)
-        self.prepared = False
+        self.request_halt()
+        self.wait_halted()

@@ -28,10 +28,11 @@ class DriveIO(Protocol):
 class CanopenTransport:
     """管理单节点 CANopen 网络；构造时不连接，open 后方可访问对象。"""
 
-    def __init__(self, settings: Settings):
-        """保存配置；settings 描述接口、节点和 SDO 超时，无返回值。"""
+    def __init__(self, settings: Settings, network=None):
+        """保存配置；可借用多轴共享 network，借用时不负责连接或断开总线。"""
         self.settings = settings
-        self.network = None
+        self.network = network
+        self._owns_network = network is None
         self.node = None
 
     def open(self) -> None:
@@ -41,15 +42,17 @@ class CanopenTransport:
         """
         try:
             import canopen
-            self.network = canopen.Network()
+            if self.network is None:
+                self.network = canopen.Network()
             self.node = self.network.add_node(self.settings.node_id, self.settings.eds)
             # SDO 往返次数固定为一次：响应丢失时不自动重发相对运动触发。
             self.node.sdo.RESPONSE_TIMEOUT = self.settings.sdo_timeout_s
             self.node.sdo.MAX_RETRIES = 1
-            self.network.connect(
-                interface=self.settings.interface, channel=self.settings.channel,
-                bitrate=self.settings.bitrate,
-            )
+            if self._owns_network:
+                self.network.connect(
+                    interface=self.settings.interface, channel=self.settings.channel,
+                    bitrate=self.settings.bitrate,
+                )
         except Exception as exc:
             self.close()
             raise TransportError(f"连接 CANopen 失败：{exc}") from exc
@@ -124,8 +127,10 @@ class CanopenTransport:
 
     def close(self) -> None:
         """释放 CAN 连接，无返回值；断开连接不会自动停止或去使能驱动器。"""
-        if self.network is not None and self.network.bus is not None:
+        if self._owns_network and self.network is not None and self.network.bus is not None:
             try:
                 self.network.disconnect()
             finally:
                 self.node = None
+        else:
+            self.node = None

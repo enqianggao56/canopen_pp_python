@@ -2,5 +2,8 @@
 
 from .controller import ProfilePositionController
 from .model import Motion, Settings
+from .group_controller import ThreeAxisController
+from .group_model import AxisConfig, GroupSettings
 
-__all__ = ["ProfilePositionController", "Motion", "Settings"]
+__all__ = ["ProfilePositionController", "Motion", "Settings", "ThreeAxisController",
+           "AxisConfig", "GroupSettings"]
