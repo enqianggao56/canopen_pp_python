@@ -1,0 +1,21 @@
+{
+  "eds": "../motor.eds",
+  "interface": "socketcan",
+  "channel": "can0",
+  "node_id": 1,
+  "bitrate": 1000000,
+  "encoder_counts_per_rev": 65536,
+  "expected_vendor_id": 768,
+  "expected_product_code": 17988,
+  "min_position_inc": -100000,
+  "max_position_inc": 100000,
+  "max_velocity_rpm": 30,
+  "max_acceleration_rps2": 10,
+  "position_tolerance_inc": 10,
+  "sdo_timeout_s": 0.3,
+  "state_timeout_s": 3,
+  "motion_timeout_s": 30,
+  "poll_interval_s": 0.02,
+  "hardware_verified": false,
+  "absolute_reference_verified": false
+}
