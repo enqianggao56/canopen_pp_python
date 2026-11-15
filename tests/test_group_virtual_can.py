@@ -15,6 +15,7 @@ from kinco_pp.group_transport import (
 from kinco_pp.objects import CW_HALT, CW_NEW_SETPOINT, Object
 from kinco_pp.simulation import SimulatedDrive
 from kinco_pp.transport import TransportError
+from kinco_pp.reciprocate import DurationReached
 
 
 class GroupVirtualCanTests(unittest.TestCase):
@@ -119,6 +120,19 @@ class GroupVirtualCanTests(unittest.TestCase):
         self.assertEqual(self.frames, [])
         self.assertTrue(all(not sim.writes for sim in self.sims))
         self.assertEqual([self.bus._snapshot(axis) for axis in self.bus.axes], snapshots)
+
+    def test_duration_hook_preserves_stop_type_and_restores_real_protocol_mapping(self):
+        """真实虚拟CAN通道触发后限时中断，应暂停全部轴并原样恢复映射。"""
+        snapshots = [self.bus._snapshot(axis) for axis in self.bus.axes]
+        def stop_after_trigger():
+            """收到共同上升沿后模拟观察截止，之后的Halt帧不视为新运动。"""
+            if any(int.from_bytes(frame, 'little') & CW_NEW_SETPOINT for frame in self.frames):
+                raise DurationReached('test deadline')
+        with self.assertRaises(DurationReached):
+            ThreeAxisController(self.bus, self.settings, poll_hook=stop_after_trigger).run()
+        self.assertTrue(all(sim.values[Object.CONTROLWORD] & CW_HALT for sim in self.sims))
+        self.assertEqual([self.bus._snapshot(axis) for axis in self.bus.axes], snapshots)
+        self.assertEqual(len(self.triggers), 3)
 
     def test_conflicting_tpdo_id_prevents_mapping_changes(self):
         """已有 TPDO 占用共享 COB-ID 时，在任何映射写入之前拒绝配置。"""

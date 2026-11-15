@@ -2,7 +2,7 @@
 
 使用 Python，通过 CANopen SDO/RPDO 控制 Kinco 伺服电机运行于 PP（Profile Position，轮廓位置）模式。支持单轴定位及三轴共同启动、共同时间规划，包含中文注释、命令行示例、模拟器及虚拟 CAN 协议测试。
 
-当前接入目标为 **iSMD60D-040-DQBK-AA000 + CANable，节点 1，1 Mbit/s**。已完成软件测试及一次实机正向 600 圈相对定位，详见[实机验证记录](docs/hardware-validation.md)。配置和机械运动范围须结合每次实机状态确认。
+当前接入目标为 **iSMD60D-040-DQBK-AA000 + CANable，1 Mbit/s**。已完成软件测试、节点 1 的实机正向 600 圈定位、节点 1/2/3 的三轴小位移定位，以及三轴各 150 圈、速度指令 600 RPM 的实机运行，详见[实机验证记录](docs/hardware-validation.md)。配置和机械运动范围须结合每次实机状态确认。
 
 ## 目录
 
@@ -101,7 +101,7 @@ Halt 是通信控制，不能代替硬件急停或 STO；通信断开或进程�
 
 ## 三轴同步运行
 
-三轴共用一条 CAN 总线。默认配置 `config/three_axis.example.json` 使用节点 1/2/3，三轴相对位移分别为 1000、2000、-1500 inc；这些是模拟示例，三轴实机尚未验证。
+三轴共用一条 CAN 总线。默认配置 `config/three_axis.example.json` 使用节点 1/2/3，三轴相对位移分别为 1000、2000、-1500 inc。已在用户确认当前机械范围后完成这组实机运动；轮询观察到的到达时间差约 10.8 ms，详情及测量限制见[三轴验证记录](docs/hardware-validation.md#三轴小位移实机验证)。示例仍默认关闭实机执行，不代表适用于其他机械状态。
 
 ```bash
 python -m pip install -e .
@@ -141,6 +141,33 @@ kinco-pp-group --config config/local.three_axis.json --execute
 - 完成上述确认后设置顶层 `pdo_configuration_verified: true`，并逐轴设置 `hardware_verified: true`；默认均为 `false`。
 - 若任一驱动器不支持映射或回读不一致，会在运动触发前失败并尝试恢复已改动配置。
 - 节点必须由当前程序独占控制；Halt 与通信异常的现场保护要求同单轴模式。
+
+## 三轴持续往返测试
+
+`kinco-pp-reciprocate` / `python -m kinco_pp.reciprocate` 用于三轴 PP 正反往返测试，默认每轴正转 600 圈、反转 600 圈，速度 600 RPM，加速和减速各 2 秒。换算后的加减速度为 **5 rps/s**，写入 0x6083/0x6084 的整数均为 5368。默认持续运行，直到 Ctrl+C；每程先停稳，再换向。
+
+```bash
+# 完整往返一次的模拟测试，不连接硬件：
+PYTHONPATH=src python3 -m kinco_pp.reciprocate --legs 2
+# 安装项目后等价入口：
+kinco-pp-reciprocate --legs 2
+```
+
+配置模板为 `config/reciprocate.example.json`。先复制为 `config/local.reciprocate.json`，核对三个节点、实际运动范围、零速反馈容差、PDO 槽位与共享 COB-ID，并完成硬件核对标志。示例中的软件范围不代表机械安全范围。往返入口根据启动位置和命令行参数重新计算每程相对目标；`axes[].motion` 仅作首程参数示意，实际软件速度及加减速度上限仍必须允许请求值。
+
+```bash
+# 在已确认600圈正反运动范围的实机上观察120秒，到时减速暂停：
+python -m kinco_pp.reciprocate --config config/local.reciprocate.json \
+  --execute --turns 600 --velocity 600 --accel-time 2 --decel-time 2 \
+  --duration 120 --csv /tmp/reciprocate-feedback.csv --output /tmp/reciprocate-result.json
+# 持续往返：省略 --duration；Ctrl+C 请求全组减速暂停。
+```
+
+程序锚定启动点及其正向 600 圈端点，按每程实际位置计算相对指令，避免多次相对定位误差累积；不会自动扩大配置的软件范围。600 RPM 为 10 rps，考虑加减速后每程约 62 秒，完整往返至少约 124 秒，另有停稳确认及配置恢复时间。因此 **120 秒观察通常在反程途中结束**，报告只统计完整到位的单程数，不冒充完成整次往返。到时先按设定减速度暂停，实际停止和清理可能略晚于120秒。
+
+若上次在途中停止，重新启动会以新的当前位置锚定端点，原软件范围可能不再允许完整正向600圈；此时程序会拒绝执行，需先按实际机械条件重新核对配置，不能直接扩大限值绕过检查。本次实机120秒观察已验证正转600圈、反转途中限时暂停，结果见[往返观察记录](docs/hardware-validation.md#三轴往返测试120秒观察)。
+
+反馈在同一控制线程采样，CSV 可记录全程，JSON 汇总完成程数、最后方向、状态及最近样本。无限运行时内存仅保留最近4096个样本和100程摘要；CSV可选。输出文件采用独占创建，请使用未存在的路径。通信、状态、采样文件写入或停机异常会停止循环并报告错误，限时停止不能掩盖暂停失败。
 
 ## 测试与开发
 

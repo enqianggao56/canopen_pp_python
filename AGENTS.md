@@ -22,6 +22,7 @@
 - `python -m pip install -e .`：安装项目与依赖。
 - `python -m kinco_pp`：模拟运行，不连接硬件。
 - `python -m kinco_pp.group_cli`：三轴模拟运行，配置见 `config/three_axis.example.json`。
+- `python -m kinco_pp.reciprocate --legs 2`：模拟一次完整往返；实机必须显式 `--execute`，限时用 `--duration`。
 - `python -m unittest discover -s tests -v`：运行单元测试与虚拟 CAN 测试。
 - `rg -n '^\[|ParameterName=' motor.eds`：查找对象字典条目。
 

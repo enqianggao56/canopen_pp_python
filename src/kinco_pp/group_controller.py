@@ -32,14 +32,16 @@ class GroupResult:
 class ThreeAxisController:
     """控制同一总线的三个轴；bus 提供三个 IO、广播、配置及恢复方法。"""
 
-    def __init__(self, bus, settings: GroupSettings, clock=time.monotonic, sleep=time.sleep):
-        """注入总线、配置及可测试的时间函数；不发送任何控制指令。"""
+    def __init__(self, bus, settings: GroupSettings, clock=time.monotonic, sleep=time.sleep,
+                 poll_hook=None):
+        """注入总线、配置及时间函数；poll_hook 可在同一线程观测或请求限时停止。"""
         if len(bus.axes) != 3:
             raise ValueError("总线必须提供三个轴")
         self.bus = bus
         self.settings = settings
         self.clock = clock
         self.sleep = sleep
+        self.poll_hook = poll_hook
         self.controllers = [ProfilePositionController(io, axis.settings, clock, sleep)
                             for io, axis in zip(bus.axes, settings.axes)]
         self._broadcast_armed = False
@@ -70,6 +72,9 @@ class ThreeAxisController:
         """轮询每个轴并检查 PP 使能/故障，任一轴超时立即退出，不顺序阻塞等待。"""
         deadlines = [self.clock() + timeout for timeout in timeouts]
         while True:
+            if self.poll_hook is not None:
+                # 放在逐轴异常包装之外，保留调用方的限时停止异常类型。
+                self.poll_hook()
             complete = True
             for index, (axis, controller, deadline) in enumerate(zip(self.settings.axes, self.controllers, deadlines)):
                 try:
@@ -119,6 +124,8 @@ class ThreeAxisController:
         primary = None
         try:
             starts = self._preflight()
+            if self.poll_hook is not None:
+                self.poll_hook()
             plan = plan_group(self.settings, starts)
             if all(p.end_inc == start for p, start in zip(plan.axes, starts)):
                 return GroupResult(starts, plan, 0.0)
@@ -146,6 +153,8 @@ class ThreeAxisController:
                            state_timeouts, "清除旧应答")
             LOG.info("共同时间 %.6fs，量化后预计到达时差 %.6fs", plan.duration_s,
                      plan.estimated_arrival_spread_s)
+            if self.poll_hook is not None:
+                self.poll_hook()
             self._broadcast_armed = True
             self._broadcast(stages[0][1] | CW_NEW_SETPOINT)
             self._wait_all(lambda index, status: bool(status & SW_SETPOINT_ACK), state_timeouts, "新指令应答")
@@ -189,4 +198,5 @@ class ThreeAxisController:
                 message = "三轴清理失败: " + "; ".join(errors)
                 if primary is None:
                     raise GroupError(message)
-                LOG.error("%s；原错误：%s", message, primary)
+                # 限时停止也必须暴露暂停/恢复失败，不能把不确定的停机当成正常结束。
+                raise GroupError(f"{message}；原错误：{primary}") from primary
