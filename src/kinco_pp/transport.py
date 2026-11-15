@@ -93,11 +93,16 @@ class CanopenTransport:
         型号及固件适用性仍需人工核对；本方法不会根据相近型号绕过不一致。
         不匹配抛 TransportError，且不发送控制指令。
         """
+        entries = self.read(Object.IDENTITY, 0)
+        if entries < 2:
+            raise TransportError("0x1018 未提供核对所需的厂商和产品标识")
+        # 实机 0x1018:00=3，未实现可选序列号；按实际条目数读取，
+        # 不因该可选字段缺失而跳过必需的厂商/产品一致性检查。
         observed = {
             "vendor_id": self.read(Object.IDENTITY, 1),
             "product_code": self.read(Object.IDENTITY, 2),
-            "revision": self.read(Object.IDENTITY, 3),
-            "serial_number": self.read(Object.IDENTITY, 4),
+            "revision": self.read(Object.IDENTITY, 3) if entries >= 3 else None,
+            "serial_number": self.read(Object.IDENTITY, 4) if entries >= 4 else None,
         }
         for subindex, name, expected in (
             (1, "vendor_id", self.settings.expected_vendor_id),

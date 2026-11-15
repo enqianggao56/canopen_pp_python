@@ -93,6 +93,22 @@ class ControllerTests(unittest.TestCase):
         self.controller.prepare()
         self.assertEqual(self.controller.move(Motion(0, 1, 1, 1)), 100)
 
+    def test_standstill_accepts_velocity_noise_only_with_stable_position(self):
+        """位置稳定时容许已配置的速度反馈噪声；持续漂移则不能判断停稳。"""
+        self.controller.settings = replace(self.settings, zero_velocity_tolerance_rpm=0.5)
+        self.controller.prepare()
+        read = self.io.read
+        with patch.object(self.io, 'read', side_effect=lambda i, s=0: 5000 if i == Object.ACTUAL_VELOCITY else read(i, s)):
+            self.controller.halt()
+        self.controller.prepare()
+        def drifting(index, subindex=0):
+            """模拟速度值虽很小，但位置持续移动的异常情况。"""
+            if index == Object.ACTUAL_POSITION:
+                self.io.values[index] += 11
+            return read(index, subindex)
+        with patch.object(self.io, 'read', side_effect=drifting), self.assertRaises(DriveTimeout):
+            self.controller.halt()
+
     def test_no_move_before_prepare(self):
         """未使能调用必须在写入前拒绝。"""
         with self.assertRaises(DriveError):
@@ -118,12 +134,26 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.io.writes, [])
 
     def test_mode_confirmation_times_out(self):
-        """模式显示未切换时不进入使能。"""
+        """使能后实际模式仍未切换时不得触发目标，准备阶段始终保持 Halt。"""
         read = self.io.read
         with patch.object(self.io, 'read', side_effect=lambda i, s=0: 0 if i == Object.MODE_DISPLAY else read(i, s)):
             with self.assertRaises(DriveTimeout):
                 self.controller.prepare()
-        self.assertNotIn((Object.CONTROLWORD, 0x10F, 0), self.io.writes)
+        controls = [v for i, v, _ in self.io.writes if i == Object.CONTROLWORD]
+        self.assertTrue(all(v & CW_HALT for v in controls))
+        self.assertFalse(any(v & CW_NEW_SETPOINT for v in controls))
+
+    def test_mode_display_can_update_only_after_enable(self):
+        """兼容只在进入 operation enabled 后更新实际模式的固件。"""
+        read = self.io.read
+        def delayed(index, subindex=0):
+            """未使能时模式显示为零，使能后才显示写入的 PP 模式。"""
+            if index == Object.MODE_DISPLAY and self.io.values[Object.STATUSWORD] & 0x6F != 0x27:
+                return 0
+            return read(index, subindex)
+        with patch.object(self.io, 'read', side_effect=delayed):
+            self.controller.prepare()
+            self.assertEqual(self.controller.move(self.motion), 1100)
 
     def test_missing_or_stale_ack_times_out(self):
         """bit12 卡高或永不置高时均须停止等待，卡高时不得触发新目标。"""

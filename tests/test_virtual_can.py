@@ -26,11 +26,14 @@ class VirtualCanTests(unittest.TestCase):
         self.node = canopen.LocalNode(self.settings.node_id, self.settings.eds)
         self.server.add_node(self.node)
         self.sim = SimulatedDrive()
+        self.identity_entries = 4
 
         def read(index, subindex, od):
             """返回模拟状态及明确的身份值；其他对象交由 EDS 默认值处理。"""
             if index == Object.IDENTITY:
-                return {0: 4, 1: 768, 2: 17988, 3: 0, 4: 123}[subindex]
+                if subindex > self.identity_entries:
+                    raise canopen.sdo.SdoAbortedError(0x06090011)
+                return {0: self.identity_entries, 1: 768, 2: 17988, 3: 0, 4: 123}[subindex]
             return self.sim.values.get(index) if index != Object.STATUSWORD else self.sim.read(index)
 
         def write(index, subindex, od, data):
@@ -60,6 +63,14 @@ class VirtualCanTests(unittest.TestCase):
         self.client.settings = replace(self.settings, expected_product_code=123)
         with self.assertRaisesRegex(TransportError, '身份不匹配'):
             self.client.verify_identity()
+        self.assertEqual(self.sim.writes, [])
+
+    def test_optional_serial_number_not_implemented(self):
+        """复现实机仅有三个身份条目的情况；核对标识时不访问不存在的子索引。"""
+        self.identity_entries = 3
+        identity = self.client.verify_identity()
+        self.assertIsNone(identity['serial_number'])
+        self.assertEqual(identity['product_code'], 17988)
         self.assertEqual(self.sim.writes, [])
 
     def test_bad_object_error_identifies_index(self):

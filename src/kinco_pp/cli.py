@@ -81,7 +81,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if controller is not None and controller.enable_started:
             try:
                 controller.halt()
-                LOG.info("已执行 Halt；驱动器保持使能，未自动去使能")
+                LOG.info("已执行 Halt 并确认静止；未额外发送去使能指令")
             except Exception as exc:
                 LOG.error("暂停失败，不能确认电机停止，请使用现场停止措施：%s", exc)
                 result = result or 1

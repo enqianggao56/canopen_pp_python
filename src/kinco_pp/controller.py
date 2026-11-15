@@ -82,8 +82,9 @@ class ProfilePositionController:
             # 上一次运行结束后仍锁轴时直接复用，避免先 shutdown 造成松轴。
             if (self.io.read(Object.MODE_DISPLAY) != PP_MODE
                     or not self.io.read(Object.CONTROLWORD) & CW_HALT
-                    or self.io.read(Object.ACTUAL_VELOCITY) != 0):
+                    or not self._speed_is_zero()):
                 raise DriveError("驱动器已使能但未处于静止的 PP Halt 状态，拒绝接管")
+            self._wait_standstill(self.settings.state_timeout_s)
             self.enable_started = True
             self._control(CW_ENABLE | CW_HALT)
             self.io.write(Object.HALT_OPTION, 1)
@@ -95,17 +96,52 @@ class ProfilePositionController:
                    self.settings.state_timeout_s, "运行就绪")
         self.io.write(Object.HALT_OPTION, 1)
         self.io.write(Object.MODE, PP_MODE)
-        self._wait(lambda status: self.io.read(Object.MODE_DISPLAY) == PP_MODE,
-                   self.settings.state_timeout_s, "PP 模式确认")
+        # 部分固件在使能后才更新 0x6061：先核对 0x6060 回读，
+        # 保持 Halt 进入使能，再确认实际模式，确认前绝不触发新位置。
+        self._wait(lambda status: self.io.read(Object.MODE) == PP_MODE,
+                   self.settings.state_timeout_s, "PP 模式设置回读")
         self._control(CW_SWITCH_ON | CW_HALT)
         self._wait(lambda status: status & STATE_MASK == STATE_SWITCHED_ON,
                    self.settings.state_timeout_s, "主回路就绪")
         self._control(CW_ENABLE | CW_HALT)
         self._wait(lambda status: status & STATE_MASK == STATE_ENABLED,
                    self.settings.state_timeout_s, "驱动器使能")
-        self._wait(lambda status: self.io.read(Object.ACTUAL_VELOCITY) == 0,
-                   self.settings.state_timeout_s, "暂停静止")
+        self._wait(lambda status: self.io.read(Object.MODE_DISPLAY) == PP_MODE,
+                   self.settings.state_timeout_s, "PP 实际模式确认")
+        self._wait_standstill(self.settings.state_timeout_s)
         self.prepared = True
+
+    def _speed_is_zero(self) -> bool:
+        """按手册 §7.2 换算 0x606C，以配置的 rpm 容差判断速度反馈接近零。"""
+        raw = self.io.read(Object.ACTUAL_VELOCITY)
+        rpm = abs(raw) * 1875 / (512 * self.settings.encoder_counts_per_rev)
+        return rpm <= self.settings.zero_velocity_tolerance_rpm
+
+    def _wait_standstill(self, timeout: float) -> None:
+        """同时确认低速与持续位置稳定，避免速度噪声或单次零值误判停稳。
+
+        timeout 单位秒；位置相对确认窗口起点变化超过到位容差时重新计时。
+        故障、读数异常及超时分别通过原有异常路径报告。
+        """
+        anchor = None
+        stable_since = None
+
+        def stationary(status: int) -> bool:
+            """更新静止采样窗口，仅在完整稳定时长后返回 True。"""
+            nonlocal anchor, stable_since
+            position = self.io.read(Object.ACTUAL_POSITION)
+            now = self.clock()
+            if not self._speed_is_zero():
+                anchor = None
+                stable_since = None
+                return False
+            if anchor is None or abs(position - anchor) > self.settings.position_tolerance_inc:
+                anchor = position
+                stable_since = now
+                return False
+            return now - stable_since >= self.settings.standstill_duration_s
+
+        self._wait(stationary, timeout, "速度与位置稳定")
 
     def move(self, motion: Motion) -> int:
         """执行一次定位并返回实际到位位置 inc；参数错误、超时或故障抛异常。
@@ -159,11 +195,10 @@ class ProfilePositionController:
         """置 bit8 并等待暂停完成，保持当前使能状态，无返回值。
 
         §5.1.2.1、§5.7.3：Halt 不是 STO 或硬件急停；通信失败不能保证停机。
-        暂停后读取 0x606C 确认零速。本方法可能抛通信、故障或超时异常。
+        暂停后联合确认 0x606C 低速与位置稳定；可能抛通信、故障或超时异常。
         """
         if not self.enable_started:
             return
         self._control((self.controlword & ~CW_NEW_SETPOINT) | CW_HALT)
-        self._wait(lambda status: self.io.read(Object.ACTUAL_VELOCITY) == 0,
-                   self.settings.motion_timeout_s, "暂停停止")
+        self._wait_standstill(self.settings.motion_timeout_s)
         self.prepared = False

@@ -49,6 +49,8 @@ class Settings:
     motion_timeout_s: float = 30.0
     poll_interval_s: float = 0.02
     position_tolerance_inc: int = 10
+    zero_velocity_tolerance_rpm: float = 0.0
+    standstill_duration_s: float = 0.05
     hardware_verified: bool = False
     absolute_reference_verified: bool = False
 
@@ -65,8 +67,15 @@ class Settings:
         for name in ("expected_vendor_id", "expected_product_code"):
             integer(getattr(self, name), 0, UINT32_MAX, name)
         for name in ("max_velocity_rpm", "max_acceleration_rps2", "sdo_timeout_s",
-                     "state_timeout_s", "motion_timeout_s", "poll_interval_s"):
+                     "state_timeout_s", "motion_timeout_s", "poll_interval_s",
+                     "standstill_duration_s"):
             positive(getattr(self, name), name)
+        tolerance = self.zero_velocity_tolerance_rpm
+        if (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
+                or not math.isfinite(tolerance) or tolerance < 0):
+            raise ValueError("zero_velocity_tolerance_rpm 必须有限且非负")
+        if self.standstill_duration_s >= min(self.state_timeout_s, self.motion_timeout_s):
+            raise ValueError("静止确认时长必须小于状态和运动超时")
         for name in ("hardware_verified", "absolute_reference_verified"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} 必须是 JSON 布尔值")

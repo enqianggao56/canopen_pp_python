@@ -2,7 +2,7 @@
 
 使用 Python，通过 CANopen SDO 控制 Kinco 伺服电机运行于 PP（Profile Position，轮廓位置）模式。包含中文注释、命令行示例、独立模拟器及虚拟 CAN 协议测试。
 
-当前接入目标为 **iSMD60D-040-DQBK-AA000 + CANable，节点 1，1 Mbit/s**。代码已做软件验证，尚未做真实电机验证；型号由用户提供，配置参数仍需结合实机确认。
+当前接入目标为 **iSMD60D-040-DQBK-AA000 + CANable，节点 1，1 Mbit/s**。已完成软件测试及一次实机正向 600 圈相对定位，详见[实机验证记录](docs/hardware-validation.md)。配置和机械运动范围须结合每次实机状态确认。
 
 ## 目录
 
@@ -55,7 +55,7 @@ cp config/servo.example.json config/local.json
 kinco-pp --config config/local.json --inspect
 ```
 
-`--inspect` 只进行 SDO 读取，不发送 NMT 启动、使能或运动指令。它读取 0x1018 身份、0x6041 状态、0x6061 模式及 0x6064 位置。正常实机执行前还会再次核对身份。
+`--inspect` 只进行 SDO 读取，不发送 NMT 启动、使能或运动指令。它读取 0x1018 身份、0x6041 状态、0x6061 模式及 0x6064 位置。身份记录按 0x1018:00 的实际条目数读取，可选序列号缺失时返回 `None`，厂商及产品标识仍严格核对。正常实机执行前还会再次核对身份。
 
 | 配置项 | 含义与需要核对的内容 |
 | --- | --- |
@@ -64,6 +64,8 @@ kinco-pp --config config/local.json --inspect
 | `min_position_inc` / `max_position_inc` | 允许的起点、终点范围，单位 inc；示例 ±100000 不是机械安全范围 |
 | `max_velocity_rpm` / `max_acceleration_rps2` | 软件速度、加减速度上限；示例 30 rpm / 10 rps/s，需按负载调整 |
 | `position_tolerance_inc` | 到位校验允许的位置误差；不能大到掩盖本次运动 |
+| `zero_velocity_tolerance_rpm` | 零速反馈容差；默认 0，实机反馈噪声需按测量设置，不能单凭速度容差认定停稳 |
+| `standstill_duration_s` | 速度低于容差且位置变化不超过位置容差的连续确认时间；必须小于状态和运动超时 |
 | `sdo_timeout_s` / `state_timeout_s` / `motion_timeout_s` | 单次 SDO、状态握手和到位等待超时，单位秒 |
 | `hardware_verified` | 人工确认型号、固件、EDS、单位、坐标范围、接线及停止方式后才改为 `true` |
 | `absolute_reference_verified` | 已建立并核对绝对坐标原点后才改为 `true`；代码不自动回零 |
@@ -86,11 +88,11 @@ kinco-pp --config config/local.json --execute --absolute --target 2000
 控制流程依据随附手册 §5.1、§5.4、§7.3、表 9-11：
 
 1. 检查身份及运动参数，向节点 1 发送 NMT 启动。
-2. 按 DS402 状态转换进入 PP 模式，读 0x6061 确认模式为 1；准备阶段保持 Halt。
+2. 按 DS402 状态转换设置 PP，先回读 0x6060，再在 Halt 下使能并确认 0x6061 为 1；实机固件仅在使能后更新模式显示，确认前不触发目标。
 3. 换算并写入 0x6081/0x6083/0x6084，再写入 0x607A。
 4. 使用控制字 bit4 上升沿触发，等待状态字 bit12 置位，再复位 bit4 并等待 bit12 清零。
 5. 同时检查 bit10 和实际位置，确认本次到位。
-6. 正常完成、异常和 Ctrl+C 均尝试 Halt，读 0x606C 确认零速，随后关闭通信。
+6. 正常完成、异常和 Ctrl+C 均尝试 Halt，联合读取 0x606C 和实际位置确认持续静止，随后关闭通信。
 
 程序设置 0x605D=1，Halt 按 0x6084 减速，并**保留使能锁轴，不自动去使能**；不会保存参数到 EEPROM。再次运行时，可复用已静止且处于 PP Halt 的使能状态，避免先松轴；其他已使能状态拒绝接管。SDO 超时不自动重发，防止重复相对位移。
 
