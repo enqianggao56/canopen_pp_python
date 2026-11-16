@@ -176,3 +176,54 @@ PYTHONPATH=src:/tmp/kinco-pp-deps python3 -m kinco_pp.reciprocate \
 同一命令重启先前往原远端，`--start-direction reverse` 可先回原起点，随后继续完整600圈往返。首次恢复段不会算作完整600圈单程。新增 `--check` 对实际当前位置和两端进行只读校验，不修改设备状态或坐标；若当前位置已因坐标重置超出原范围，或请求圈数超过原范围，仍然拒绝。
 
 修复后的实机只读校验已通过，未触发新的电机运动；读取时三轴控制字均为0x0006、状态字均为0x4231，未处于运行使能状态。回归测试共67项通过，覆盖中途重启、续反程、端点自动换向、恢复段计数、限值保持、只读入口及旧配置兼容。
+
+## 四轴RS06接入的软件验证与只读尝试
+
+日期：2026-11-15。用户要求在原三轴基础上增加RS06，节点0x04，PP模式、100 RPM，
+随后确认正反各100圈，与原三轴一起启动、一起到位，四轴全部到位后再换向。
+前三轴保持每程600圈、600 RPM，加减速各2秒；RS06也采用2秒加减速。
+
+资料使用本机原始`RS06.eds`和`RS06使用说明书260428.pdf`，原样保留在仓库，
+按手册§5.3/§5.4/§5.6分别实现厂家单位与控制流程。
+RS06的0x6081=1000、0x6083=500，每圈位置16384 inc；不使用Kinco bit12握手或Halt字。
+EDS列出0x6084但CANopen步骤未说明其作用，本程序不写入该对象；
+加减速共同使用0x6083的前提为§4.2.10的`acc_stutus=0`，尚待现场确认。
+
+四轴采用两个同步RPDO：Kinco三轴共享控制字COB-ID 0x500，RS06绝对目标COB-ID 0x504，
+装载后以同一条SYNC 0x80触发。临时映射与SYNC周期只在确认全组停稳后恢复。
+完整单程共同规划约62.000265秒，整数轮廓模型时差约0.000265秒；这不是实机同步精度。
+
+软件验证命令：
+
+```bash
+PYTHONPATH=src:tests:/tmp/kinco-pp-deps python3 -m unittest discover -s tests -v
+PYTHONPATH=src:/tmp/kinco-pp-deps python3 -m compileall -q src examples tests
+PYTHONPATH=src:/tmp/kinco-pp-deps python3 -m kinco_pp.four_axis_reciprocate \
+  --legs 2 --csv /tmp/four-axis-final-feedback.csv --output /tmp/four-axis-final-result.json
+```
+
+`/tmp/kinco-pp-deps`为本机既有临时依赖目录；常规安装后的命令见README。
+全部86项测试通过，其中四轴新增19项，包括4项真实EDS/SDO/同步RPDO虚拟CAN测试。
+覆盖100 RPM换算、力矩必设、看门狗回读、无bit12握手、同一SYNC释放四节点、
+四轴到位屏障、恢复段独立计数、任一厂家故障/通信失败/模式退出/超范围时的全组停止、
+限时与中断、部分映射失败恢复及只读检查不写控制对象。
+编译检查通过，命令行模拟正反两程完成，CSV/JSON均包含四轴独立单位反馈。
+模拟器不模拟机械运动时间，模拟轮询时差不表示硬件同步效果。
+另按pyproject构建隔离环境成功生成0.4.0 wheel，并安装到临时目录，
+实际调用安装后的`kinco-pp-four-axis --legs 2`完成模拟往返；未修改系统Python环境。
+
+实机只读尝试命令：
+
+```bash
+PYTHONPATH=src:/tmp/kinco-pp-deps python3 -m kinco_pp.four_axis_reciprocate \
+  --config config/local.reciprocate.json --check --output /tmp/four-axis-read-only-check.json
+```
+
+当时`can0`为UP、ERROR-ACTIVE、1 Mbit/s；节点1的0x1018:00返回
+`No SDO response received`，检查在身份阶段退出，返回码1。
+运行器未创建，因此没有生成该JSON结果，也未发送NMT启动、PDO配置、使能、SYNC或运动命令。
+未自动重试运动、修改本地端点或放宽软件范围。
+
+本次未能完成四轴实机身份/固件核对或运动验证。RS06实际绝对起点、负载力矩、
+加减速耦合配置、同步RPDO支持、发送余量、看门狗及急停浪涌响应仍需现场确认；
+模板的起点0和验证标志false保持不变。

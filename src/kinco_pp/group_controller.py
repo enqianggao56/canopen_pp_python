@@ -27,14 +27,19 @@ class GroupResult:
     positions: Tuple[int, ...]
     plan: GroupPlan
     observed_arrival_spread_s: float
+    observed_arrival_times_s: Tuple[float, ...] = ()
 
 
 class ThreeAxisController:
     """控制同一总线的三个轴；bus 提供三个 IO、广播、配置及恢复方法。"""
 
     def __init__(self, bus, settings: GroupSettings, clock=time.monotonic, sleep=time.sleep,
-                 poll_hook=None):
-        """注入总线、配置及时间函数；poll_hook 可在同一线程观测或请求限时停止。"""
+                 poll_hook=None, peers=()):
+        """注入总线、时钟及轮询函数；peers 为独立触发、共同监视和停止的伴随轴。
+
+        伴随轴不接收 Kinco 共享控制字；必须提供预检查、准备、触发、轮询、
+        complete 到位标志以及分离的暂停请求/停稳确认接口。
+        """
         if len(bus.axes) != 3:
             raise ValueError("总线必须提供三个轴")
         self.bus = bus
@@ -42,6 +47,7 @@ class ThreeAxisController:
         self.clock = clock
         self.sleep = sleep
         self.poll_hook = poll_hook
+        self.peers = tuple(peers)
         self.controllers = [ProfilePositionController(io, axis.settings, clock, sleep)
                             for io, axis in zip(bus.axes, settings.axes)]
         self._broadcast_armed = False
@@ -59,6 +65,8 @@ class ThreeAxisController:
                     raise GroupError(f"轴 {axis.name} 已使能且未处于 PP Halt，拒绝接管")
             starts.append(io.read(Object.ACTUAL_POSITION))
         plan_group(self.settings, tuple(starts))
+        for peer in self.peers:
+            peer.preflight()
         return tuple(starts)
 
     def _broadcast(self, value: int) -> None:
@@ -68,13 +76,15 @@ class ThreeAxisController:
             controller.controlword = value
         self.bus.broadcast(value)
 
-    def _wait_all(self, predicate, timeouts, label: str) -> None:
+    def _wait_all(self, predicate, timeouts, label: str, wait_for_peers=False) -> None:
         """轮询每个轴并检查 PP 使能/故障，任一轴超时立即退出，不顺序阻塞等待。"""
         deadlines = [self.clock() + timeout for timeout in timeouts]
         while True:
             if self.poll_hook is not None:
                 # 放在逐轴异常包装之外，保留调用方的限时停止异常类型。
                 self.poll_hook()
+            for peer in self.peers:
+                peer.poll()
             complete = True
             for index, (axis, controller, deadline) in enumerate(zip(self.settings.axes, self.controllers, deadlines)):
                 try:
@@ -85,7 +95,7 @@ class ThreeAxisController:
                 except Exception as exc:
                     raise GroupError(f"轴 {axis.name}: {exc}") from exc
                 complete = complete and done
-            if complete:
+            if complete and (not wait_for_peers or all(peer.complete for peer in self.peers)):
                 return
             self.sleep(min(a.settings.poll_interval_s for a in self.settings.axes))
 
@@ -101,16 +111,19 @@ class ThreeAxisController:
                 self._broadcast((self._last_controlword & ~CW_NEW_SETPOINT) | CW_HALT)
             except Exception as exc:
                 errors.append(f"广播暂停: {exc}")
-        for axis, controller in zip(self.settings.axes, self.controllers):
+        stop_targets = [(axis.name, controller)
+                        for axis, controller in zip(self.settings.axes, self.controllers)]
+        stop_targets.extend((peer.name, peer) for peer in self.peers)
+        for name, controller in stop_targets:
             try:
                 controller.request_halt()
             except Exception as exc:
-                errors.append(f"轴 {axis.name} 暂停请求: {exc}")
-        for axis, controller in zip(self.settings.axes, self.controllers):
+                errors.append(f"轴 {name} 暂停请求: {exc}")
+        for name, controller in stop_targets:
             try:
                 controller.wait_halted()
             except Exception as exc:
-                errors.append(f"轴 {axis.name} 停稳确认: {exc}")
+                errors.append(f"轴 {name} 停稳确认: {exc}")
         self._broadcast_armed = False
         if errors:
             raise GroupError("; ".join(errors))
@@ -127,7 +140,7 @@ class ThreeAxisController:
             if self.poll_hook is not None:
                 self.poll_hook()
             plan = plan_group(self.settings, starts)
-            if all(p.end_inc == start for p, start in zip(plan.axes, starts)):
+            if not self.peers and all(p.end_inc == start for p, start in zip(plan.axes, starts)):
                 return GroupResult(starts, plan, 0.0)
             self.bus.configure()
             self.bus.start_all()
@@ -136,6 +149,8 @@ class ThreeAxisController:
                     controller.prepare()
                 except Exception as exc:
                     raise GroupError(f"轴 {axis.name} 准备失败: {exc}") from exc
+            for peer in self.peers:
+                peer.prepare()
             # 使能过程中位置可能有微小变化，触发前重新规划及检查所有起终点。
             starts = tuple(io.read(Object.ACTUAL_POSITION) for io in self.bus.axes)
             plan = plan_group(self.settings, starts)
@@ -157,6 +172,10 @@ class ThreeAxisController:
                 self.poll_hook()
             self._broadcast_armed = True
             self._broadcast(stages[0][1] | CW_NEW_SETPOINT)
+            # 混合总线负责先装载不同厂家的 RPDO，再由同一 SYNC 释放。
+            # trigger 只记录已触发状态，不允许在这里另发一次位置目标。
+            for peer in self.peers:
+                peer.trigger()
             self._wait_all(lambda index, status: bool(status & SW_SETPOINT_ACK), state_timeouts, "新指令应答")
             self._broadcast(stages[0][1])
             self._wait_all(lambda index, status: not status & SW_SETPOINT_ACK, state_timeouts, "应答复位")
@@ -173,11 +192,12 @@ class ThreeAxisController:
                     arrivals[index] = self.clock()
                 return done
 
-            self._wait_all(reached, [a.settings.motion_timeout_s for a in self.settings.axes], "三轴到位")
+            self._wait_all(reached, [a.settings.motion_timeout_s for a in self.settings.axes],
+                           "三轴到位", wait_for_peers=True)
             moving_arrivals = [arrival for index, arrival in enumerate(arrivals)
                                if stages[index][0] != starts[index]]
             spread = max(moving_arrivals) - min(moving_arrivals) if moving_arrivals else 0.0
-            return GroupResult(tuple(positions), plan, spread)
+            return GroupResult(tuple(positions), plan, spread, tuple(arrivals))
         except BaseException as exc:
             primary = exc
             raise

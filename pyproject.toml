@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kinco-canopen-pp"
-version = "0.3.1"
-description = "Kinco servo CANopen Profile Position controller"
+version = "0.4.0"
+description = "Kinco and RS06 servo CANopen Profile Position controller"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = ["canopen>=2.3,<3", "python-can>=4.3,<5"]
@@ -14,6 +14,7 @@ dependencies = ["canopen>=2.3,<3", "python-can>=4.3,<5"]
 kinco-pp = "kinco_pp.cli:main"
 kinco-pp-group = "kinco_pp.group_cli:main"
 kinco-pp-reciprocate = "kinco_pp.reciprocate:main"
+kinco-pp-four-axis = "kinco_pp.four_axis_reciprocate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

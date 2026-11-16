@@ -67,7 +67,8 @@ class ReciprocationRunner:
     """在同一总线上重复同步 PP 单程，锚定起点和远端，避免相对定位误差累积。"""
 
     def __init__(self, bus, settings: GroupSettings, parameters: RunParameters,
-                 clock=time.monotonic, sleep=time.sleep, sample_sink=None):
+                 clock=time.monotonic, sleep=time.sleep, sample_sink=None,
+                 controller_factory=ThreeAxisController):
         """注入三轴总线和可测试时钟；sample_sink 可流式写 CSV，不另开 SDO 连接。"""
         self.bus = bus
         self.settings = settings
@@ -75,6 +76,7 @@ class ReciprocationRunner:
         self.clock = clock
         self.sleep = sleep
         self.sample_sink = sample_sink
+        self.controller_factory = controller_factory
         self.started_at = None
         self.next_sample = 0.0
         self.next_log = 0.0
@@ -89,7 +91,7 @@ class ReciprocationRunner:
         """观察时间到达时抛 DurationReached，由控制器正常执行全组减速暂停。"""
         if (self.started_at is not None and self.parameters.duration_s is not None
                 and self.clock() - self.started_at >= self.parameters.duration_s):
-            raise DurationReached('已达到观察时间，暂停三轴')
+            raise DurationReached('已达到观察时间，暂停全部轴')
 
     def _poll(self):
         """在主控制线程检查截止时间并采样；读取失败会进入全组故障暂停路径。"""
@@ -98,10 +100,10 @@ class ReciprocationRunner:
         if elapsed < self.next_sample:
             return
         positions, velocities, statuses = [], [], []
-        for axis, config in zip(self.bus.axes, self.settings.axes):
+        for axis, settings in self._feedback_axes():
             positions.append(axis.read(Object.ACTUAL_POSITION))
             raw = axis.read(Object.ACTUAL_VELOCITY)
-            velocities.append(raw * 1875 / (512 * config.settings.encoder_counts_per_rev))
+            velocities.append(settings.feedback_velocity_rpm(raw))
             statuses.append(axis.read(Object.STATUSWORD))
         row = dict(elapsed_s=elapsed, phase=self.phase, positions_inc=positions,
                    velocities_rpm=velocities, statuswords=statuses)
@@ -114,6 +116,10 @@ class ReciprocationRunner:
             LOG.info('观察 %.2fs，方向=%s，速度反馈 rpm=%s，位置 inc=%s', elapsed, self.phase,
                      ', '.join(f'{v:+.2f}' for v in velocities), positions)
             self.next_log = elapsed + 5
+
+    def _feedback_axes(self):
+        """返回反馈 IO 和设备单位配置；伴随轴运行器可追加不同厂家的反馈。"""
+        return list(zip(self.bus.axes, (axis.settings for axis in self.settings.axes)))
 
     def _leg_settings(self, endpoints, starts=None):
         """以固定端点和当前反馈计算相对指令，不自动扩大用户配置的软件运动范围。"""
@@ -194,8 +200,8 @@ class ReciprocationRunner:
                 self.phase = 'forward' if forward else 'reverse'
                 endpoints = distant if forward else origin
                 leg = self._leg_settings(endpoints)
-                controller = ThreeAxisController(self.bus, leg, self.clock, self.sleep,
-                                                 poll_hook=self._poll)
+                controller = self.controller_factory(self.bus, leg, self.clock, self.sleep,
+                                                     poll_hook=self._poll)
                 LOG.info('开始第 %d 程：%s，目标端点=%s，速度上限=%.2f rpm，加/减速=%.3f/%.3fs',
                          self.report['completed_legs'] + 1, self.phase, endpoints,
                          self.parameters.velocity_rpm, self.parameters.acceleration_time_s,
@@ -216,10 +222,10 @@ class ReciprocationRunner:
             self.report['success'] = True
         except DurationReached:
             self.report.update(stop_reason='duration', success=True)
-            LOG.info('观察时间结束，三轴暂停与配置清理已完成')
+            LOG.info('观察时间结束，全部轴停止与配置清理已完成')
         except KeyboardInterrupt:
             self.report.update(stop_reason='interrupt', success=True)
-            LOG.info('收到 Ctrl+C，三轴暂停与配置清理已完成')
+            LOG.info('收到 Ctrl+C，全部轴停止与配置清理已完成')
         except BaseException as exc:
             self.report.update(stop_reason='error', error=str(exc))
             raise
@@ -229,13 +235,13 @@ class ReciprocationRunner:
             self.report['samples'] = list(self.samples)
         # 这里的只读复查在全组停止/映射恢复后进行，异常不能误报成功。
         try:
-            self.report['final_states'] = [dict(node_id=config.settings.node_id,
+            self.report['final_states'] = [dict(node_id=settings.node_id,
                 position_inc=io.read(Object.ACTUAL_POSITION), controlword=io.read(Object.CONTROLWORD),
                 statusword=io.read(Object.STATUSWORD), mode=io.read(Object.MODE_DISPLAY),
                 velocity_raw=io.read(Object.ACTUAL_VELOCITY))
-                for config, io in zip(self.settings.axes, self.bus.axes)]
-            for row, config in zip(self.report['final_states'], self.settings.axes):
-                row['velocity_rpm'] = row['velocity_raw'] * 1875 / (512 * config.settings.encoder_counts_per_rev)
+                for io, settings in self._feedback_axes()]
+            for row, (_, settings) in zip(self.report['final_states'], self._feedback_axes()):
+                row['velocity_rpm'] = settings.feedback_velocity_rpm(row['velocity_raw'])
         except Exception as exc:
             self.report.update(success=False, error=f'停止后状态读取失败：{exc}')
             raise
@@ -249,8 +255,9 @@ def main(argv=None):
     出错返回 1，Ctrl+C 正常停止返回 130，限时或指定程数完成返回 0。
     --output 保存 JSON 摘要，--csv 流式记录完整反馈，均由用户显式指定路径。
     """
-    parser = argparse.ArgumentParser(description='三轴 PP 正反往返测试；默认模拟，Ctrl+C 暂停')
+    parser = argparse.ArgumentParser(description='三轴或三台Kinco加RS06四轴 PP 往返；默认模拟，Ctrl+C 停止')
     parser.add_argument('--config', default='config/reciprocate.example.json')
+    parser.add_argument('--rs06-config', help='附加 RS06 独立配置，启用四轴共同 SYNC 往返')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--execute', action='store_true', help='执行已核对配置的实机运动')
     mode.add_argument('--check', action='store_true', help='只连接实机读取并校验往返端点，不触发运动')
@@ -273,6 +280,16 @@ def main(argv=None):
         parameters = RunParameters(args.turns, args.velocity, args.accel_time, args.decel_time,
                                    args.duration, args.legs, args.sample_interval, args.start_direction)
         settings = GroupSettings.load(args.config)
+        rs06 = None
+        if args.rs06_config:
+            from .rs06 import RS06Settings
+            from .four_axis_reciprocate import (FourAxisBus, FourAxisReciprocationRunner,
+                                                SimulatedFourAxisBus, validate_topology)
+            rs06 = RS06Settings.load(args.rs06_config)
+            validate_topology(settings, rs06)
+            if args.execute and not (rs06.hardware_verified and rs06.absolute_reference_verified
+                                     and rs06.synchronous_pdo_verified):
+                raise ValueError('RS06 实机运行前须核对 hardware_verified、absolute_reference_verified、synchronous_pdo_verified')
         if args.execute and (not settings.pdo_configuration_verified
                 or not all(a.settings.hardware_verified for a in settings.axes)):
             raise ValueError('实机运行前必须核对所有 hardware_verified 和 pdo_configuration_verified')
@@ -281,6 +298,8 @@ def main(argv=None):
             csv_file = Path(args.csv).open('x', newline='', encoding='utf-8')
             writer = csv.writer(csv_file)
             nodes = [a.settings.node_id for a in settings.axes]
+            if rs06 is not None:
+                nodes.append(rs06.node_id)
             writer.writerow(['elapsed_s', 'phase']
                             + [f'node{node}_rpm' for node in nodes]
                             + [f'node{node}_inc' for node in nodes]
@@ -292,13 +311,16 @@ def main(argv=None):
                                 + row['positions_inc'] + row['statuswords'])
                 csv_file.flush()
         if args.execute or args.check:
-            bus = CanopenGroupBus(settings)
+            bus = CanopenGroupBus(settings) if rs06 is None else FourAxisBus(settings, rs06)
             bus.open()
-            LOG.info('三轴身份：%s', bus.verify_identities())
+            LOG.info('全部轴身份：%s', bus.verify_identities())
+            if rs06 is not None:
+                bus.check_sync_configuration()
         else:
             LOG.info('模拟往返，不连接CAN或真实电机；模拟器不模拟机械运动时间')
-            bus = SimulatedGroupBus()
-        runner = ReciprocationRunner(bus, settings, parameters, sample_sink=sink)
+            bus = SimulatedGroupBus() if rs06 is None else SimulatedFourAxisBus()
+        runner = (ReciprocationRunner(bus, settings, parameters, sample_sink=sink) if rs06 is None
+                  else FourAxisReciprocationRunner(bus, settings, parameters, rs06, sample_sink=sink))
         if args.check:
             checked = runner.check()
             runner.report.update(checked, check_only=True, success=True, stop_reason='check')

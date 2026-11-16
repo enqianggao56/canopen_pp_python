@@ -1,6 +1,6 @@
 # Kinco CANopen PP Python
 
-使用 Python，通过 CANopen SDO/RPDO 控制 Kinco 伺服电机运行于 PP（Profile Position，轮廓位置）模式。支持单轴定位及三轴共同启动、共同时间规划，包含中文注释、命令行示例、模拟器及虚拟 CAN 协议测试。
+使用 Python，通过 CANopen SDO/RPDO 控制 Kinco 伺服电机运行于 PP（Profile Position，轮廓位置）模式。支持单轴、三轴，以及三台 Kinco 加一台 RobStride RS06 的四轴往返，包含中文注释、命令行示例、模拟器及虚拟 CAN 协议测试。四轴扩展尚未完成实机运动验证。
 
 当前接入目标为 **iSMD60D-040-DQBK-AA000 + CANable，1 Mbit/s**。已完成软件测试、节点 1 的实机正向 600 圈定位、节点 1/2/3 的三轴小位移定位，以及三轴各 150 圈、速度指令 600 RPM 的实机运行，详见[实机验证记录](docs/hardware-validation.md)。配置和机械运动范围须结合每次实机状态确认。
 
@@ -178,6 +178,37 @@ PYTHONPATH=src:/tmp/kinco-pp-deps python3 -m kinco_pp.reciprocate \
 
 反馈在同一控制线程采样，CSV 可记录全程，JSON 汇总完成程数、最后方向、状态及最近样本。无限运行时内存仅保留最近4096个样本和100程摘要；CSV可选。输出文件采用独占创建，请使用未存在的路径。通信、状态、采样文件写入或停机异常会停止循环并报告错误，限时停止不能掩盖暂停失败。
 
+## 三台 Kinco 加 RS06 四轴往返
+
+独立入口为`python -m kinco_pp.four_axis_reciprocate` / `kinco-pp-four-axis`。默认前三轴节点1/2/3，每程600圈、600 RPM；RS06节点 **0x04，每程100圈、100 RPM**。加减速各2秒，四轴共同时间约62秒，全部到位并停稳后一起换向。持续运行至Ctrl+C，也支持`--duration`限时和`--legs`限制到位段数。
+
+```bash
+# 模拟完整往返一次，不连接CAN：
+PYTHONPATH=src python3 -m kinco_pp.four_axis_reciprocate --legs 2
+# 安装项目后的等价入口：
+kinco-pp-four-axis --legs 2
+python examples/four_axis_reciprocate.py --legs 2
+```
+
+前三轴继续使用原往返配置和固定端点，第四轴使用独立的`config/rs06.example.json`。RS06按随附原始`RS06使用说明书260428.pdf` §5.3/§5.4/§5.6和`RS06.eds`实现：一圈16384 inc，100 RPM对应0x6081=1000，两秒加速对应0x6083=500，不使用Kinco的单位或bit12握手。
+
+四轴同步RPDO分别装载Kinco共享控制字和RS06绝对目标，再用**同一条SYNC释放四轴命令**。按[CANopen SYNC文档](https://canopen.readthedocs.io/en/stable/sync.html)协调消费者；实机内部处理差异仍需验证。默认整数轮廓模型到达时差约0.265 ms，程序另外报告包含通信与到位确认窗口的四轴轮询时差；均不等于实机同步精度。
+
+```bash
+cp config/rs06.example.json config/local.rs06.json
+# 先配置第四轴已确认的绝对端点与限值，再只读检查，不使能、不发SYNC或运动：
+python -m kinco_pp.four_axis_reciprocate \
+  --config config/local.reciprocate.json --rs06-config config/local.rs06.json --check
+# 完成设备、坐标、力矩、停止方式及同步PDO核对后持续往返：
+python -m kinco_pp.four_axis_reciprocate \
+  --config config/local.reciprocate.json --rs06-config config/local.rs06.json --execute \
+  --csv /tmp/four-axis-feedback.csv --output /tmp/four-axis-result.json
+```
+
+RS06模板起点0仅供模拟，不能直接当作实机坐标；固定两端相差1638400 inc才是100圈。默认验证标志均关闭。任一轴异常会请求四轴停止，逐轴确认停稳后恢复临时PDO和SYNC周期；中途恢复段与完整单程分别计数。RS06按厂家手册使用控制字11停止，须核对浪涌电压及负载停止方式；不会套用Kinco的Halt锁轴行为。
+
+详细配置、资料差异和验证要求见[四轴接入说明](docs/rs06-four-axis.md)。本次只读实机检查在节点1的SDO身份读取处无应答，未使能或运动，见[接入验证记录](docs/hardware-validation.md#四轴rs06接入的软件验证与只读尝试)。
+
 ## 测试与开发
 
 ```bash
@@ -186,6 +217,8 @@ python -m compileall -q src examples tests
 ```
 
 测试使用标准库 `unittest`，覆盖换算、状态切换、PP 应答、重复相对运动、负坐标、旧到位位、超时、故障和中断清理。三轴测试额外验证时间规划、单帧触发、节点重复/掉线、共享 COB-ID 冲突、部分映射失败回滚及全组暂停。协议测试采用 `canopen.LocalNode` 与 `python-can` 的 `virtual` 后端，不访问 CANable。模拟结果不等同于真实电机验证。
+
+四轴测试额外覆盖RS06独立单位及无bit12流程、共同SYNC、等待第四轴后换向、任一厂家的异常联停、映射拒绝回滚、端点恢复及四轴反馈。虚拟CAN从站使用两份真实EDS，缓存同步RPDO至同一SYNC再执行。
 
 模块和函数提供中文说明，关键步骤标明索引、位定义及单位。保留单轴命令与 API；三轴使用 `ThreeAxisController`、`GroupSettings` 和 `CanopenGroupBus`。同一节点不得由多个控制器并发操作。
 

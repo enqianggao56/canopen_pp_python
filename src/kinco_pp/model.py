@@ -113,6 +113,10 @@ class Settings:
         positive(rpm, "速度 rpm")
         return self._raw(rpm * 512 * self.encoder_counts_per_rev / 1875)
 
+    def feedback_velocity_rpm(self, raw: int) -> float:
+        """按 Kinco 手册 §7.2 将 0x606C 有符号原始速度转换为 rpm。"""
+        return raw * 1875 / (512 * self.encoder_counts_per_rev)
+
     def acceleration_raw(self, rps2: float) -> int:
         """把 rps/s 转成 0x6083/0x6084 的 uint32，向下取整。
 

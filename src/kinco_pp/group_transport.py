@@ -13,6 +13,7 @@ from .transport import CanopenTransport, TransportError
 PDO_DISABLED = 1 << 31
 PDO_CONTROLWORD_MAPPING = (int(Object.CONTROLWORD) << 16) | 16
 PDO_ASYNCHRONOUS = 254
+PDO_SYNCHRONOUS = 1
 
 
 class CanopenGroupBus:
@@ -26,6 +27,7 @@ class CanopenGroupBus:
         self._snapshots = []
         self._changed = []
         self.configured = False
+        self.transmission_type = PDO_ASYNCHRONOUS
         self.comm_index = 0x1400 + settings.rpdo_number - 1
         self.map_index = 0x1600 + settings.rpdo_number - 1
 
@@ -91,7 +93,7 @@ class CanopenGroupBus:
                     cob_id = axis.read(index, 1)
                     if not cob_id & PDO_DISABLED and cob_id & 0x1FFFFFFF == self.settings.shared_cob_id:
                         raise TransportError(f"节点 {axis.settings.node_id} 已有其他 PDO 使用共享 COB-ID")
-        expected = (self.settings.shared_cob_id, PDO_ASYNCHRONOUS, (PDO_CONTROLWORD_MAPPING,))
+        expected = (self.settings.shared_cob_id, self.transmission_type, (PDO_CONTROLWORD_MAPPING,))
         for axis, snapshot in zip(self.axes, self._snapshots):
             self._changed.append((axis, snapshot))
             axis.node.nmt.state = "PRE-OPERATIONAL"
