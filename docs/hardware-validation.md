@@ -323,3 +323,39 @@ JSON的`hardware_validated=false`是软件不自动认证机械同步精度的�
 本次软件检查：`PYTHONPATH=src:tests:/tmp/kinco-pp-deps python3 -m unittest discover -s tests -q`
 共96项通过；`python3 -m compileall -q src examples tests`通过。构建0.4.1 wheel并安装到临时目录，
 实际调用安装后的`kinco-pp-four-axis --legs 2`完成模拟往返，未连接真实电机。
+
+## RS06运动反馈改用TPDO的软件验证
+
+日期：2026-11-16。本次仅修改软件并运行模拟/虚拟CAN，未连接CANable或真实电机。
+此前四轴完整往返的RS06反馈使用SDO，不作为本次TPDO改动的实机验证结果。
+
+资料依据为原始`RS06.eds`及`RS06使用说明书260428.pdf`§5.2/§5.4。
+既有身份记录为Vendor 1366、Product 17988、Revision 0x500；本次没有重新读取实机身份。
+EDS允许6041、6064、6061、606C映射，但默认TPDO1只有状态和位置，因此程序临时配置：
+
+- TPDO1：6041(16)+6064(32)+6061(8)，节点4的COB-ID为0x184。
+- TPDO2：606C(32)，节点4的COB-ID为0x284。
+- 两条通道均使用同步类型1；状态/位置/模式与速度分别检查通信时效。
+- 使能、参数配置、停止及停稳复核仍走SDO；运动反馈不退回SDO轮询。
+- 全组停稳后恢复原TPDO映射、COB-ID、类型、禁止时间、事件定时器及SYNC起始值。
+
+验证命令与结果：
+
+```bash
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+# 106项通过，含真实EDS的python-can virtual协议测试
+python3 -m compileall -q src examples tests
+# 通过
+PYTHONPATH=src python3 -m kinco_pp.four_axis_reciprocate --legs 2
+# 纯模拟：四轴完成2个完整单程、1个完整往返
+git diff --check
+# 通过
+```
+
+覆盖全部四轴运动期禁用反馈SDO仍完成定位、RS06状态或速度缺帧联停、负位置/负速度解码、
+两条缓存独立过期、异常帧长不刷新缓存、触发前清除旧缓存、反馈COB-ID冲突、
+RS06 TPDO配置中途拒绝后的全组配置恢复，以及恢复一条通道失败仍处理另一条通道。
+原始EDS/PDF、已确认端点及软件限位未修改。
+
+尚未验证实机TPDO重映射、持续反馈周期、总线负载、断帧联停及实际运动表现。
+实机使用前须重新核对RS06 TPDO1/2槽位和COB-ID可用性，并验证现有固件的同步反馈行为。

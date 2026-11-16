@@ -1,4 +1,4 @@
-"""四轴真实 EDS/SDO/同步 RPDO 协议回归；仅连接 python-can virtual，不连接 can0。"""
+"""四轴真实 EDS/SDO/同步 RPDO/TPDO 协议回归；仅连接 python-can virtual，不连接 can0。"""
 
 import unittest
 import uuid
@@ -40,6 +40,9 @@ class FourAxisVirtualCanTests(unittest.TestCase):
         self.rs_sync_armed = False
         self.legacy_control_collisions = 0
         self.drop_feedback_node = None
+        self.drop_feedback_channel = None
+        self.reject_rs_tpdo_mapping = False
+        self.feedback_frames = []
         configs = [axis.settings for axis in self.settings.axes] + [self.rs06]
         for config in configs:
             local = canopen.LocalNode(config.node_id, config.eds)
@@ -94,6 +97,9 @@ class FourAxisVirtualCanTests(unittest.TestCase):
             if local.id == 4 and index == 0x1603 and subindex == 1 and self.reject_rs_mapping:
                 self.reject_rs_mapping = False
                 raise canopen.sdo.SdoAbortedError(0x06040041)
+            if local.id == 4 and index == 0x1A01 and subindex == 1 and self.reject_rs_tpdo_mapping:
+                self.reject_rs_tpdo_mapping = False
+                raise canopen.sdo.SdoAbortedError(0x06040041)
             if local.id != 4 and index == 0x1006 and od.decode_raw(data) == 0:
                 # 实机Kinco不接受0周期；不能在运动前强制改为0。
                 raise canopen.sdo.SdoAbortedError(0x06090030)
@@ -147,23 +153,35 @@ class FourAxisVirtualCanTests(unittest.TestCase):
             elif mapping == TARGET_POSITION_MAPPING:
                 sim.write(Object.TARGET_POSITION, int.from_bytes(frame, 'little', signed=True))
         self.pending.clear()
-        for local, sim in zip(self.locals[:3], self.sims[:3]):
+        for local, sim in zip(self.locals, self.sims):
             if local.nmt.state != 'OPERATIONAL':
                 continue
-            status = sim.read(Object.STATUSWORD)
+            sim.read(Object.STATUSWORD)
             if local.id == self.drop_feedback_node:
                 continue
-            payload = (status.to_bytes(2, 'little')
-                       + sim.values[Object.ACTUAL_POSITION].to_bytes(4, 'little', signed=True)
-                       + sim.values[Object.MODE_DISPLAY].to_bytes(1, 'little', signed=True))
-            state_cob = int.from_bytes(local.get_data(0x1800, 1), 'little')
-            if not state_cob & PDO_DISABLED:
-                self.server.send_message(state_cob & 0x7FF, payload)
-            speed_cob = int.from_bytes(local.get_data(0x1801, 1), 'little')
-            speed_count = int.from_bytes(local.get_data(0x1A01, 0), 'little')
-            if not speed_cob & PDO_DISABLED and speed_count == 1:
-                self.server.send_message(speed_cob & 0x7FF,
-                    sim.values[Object.ACTUAL_VELOCITY].to_bytes(4, 'little', signed=True))
+            for comm_index in (0x1800, 0x1801):
+                if (local.id, comm_index) == self.drop_feedback_channel:
+                    continue
+                cob_id = int.from_bytes(local.get_data(comm_index, 1), 'little')
+                transmission = int.from_bytes(local.get_data(comm_index, 2), 'little')
+                if cob_id & PDO_DISABLED or transmission != 1:
+                    continue
+                map_index = comm_index + 0x200
+                count = int.from_bytes(local.get_data(map_index, 0), 'little')
+                payload = b''
+                # 按从站实际映射组帧，避免硬编码七字节掩盖配置遗漏或错序。
+                for sub in range(1, count + 1):
+                    mapping = int.from_bytes(local.get_data(map_index, sub), 'little')
+                    index, object_sub, bits = mapping >> 16, (mapping >> 8) & 0xFF, mapping & 0xFF
+                    if not mapping:
+                        continue
+                    variable = local.object_dictionary[index]
+                    key = (index, object_sub) if object_sub else index
+                    value = sim.values[key]
+                    payload += variable.encode_raw(value)[:bits // 8]
+                if payload:
+                    self.feedback_frames.append((local.id, comm_index, payload))
+                    self.server.send_message(cob_id & 0x7FF, payload)
 
     def test_four_eds_nodes_share_network_and_start_on_same_sync(self):
         """验证身份、100RPM真实编解码、共同SYNC、正反两程和四轴原配置恢复。"""
@@ -255,8 +273,8 @@ class FourAxisVirtualCanTests(unittest.TestCase):
         self.assertEqual(io.read(Object.ACTUAL_POSITION), 12345)
         self.assertEqual(self.bus.rs06_io.read(Object.ACTUAL_POSITION), 67890)
 
-    def test_motion_feedback_does_not_poll_kinco_sdo_objects(self):
-        """运动期禁止Kinco反馈SDO访问，仍可凭TPDO1/2完成同帧触发和定位。"""
+    def test_motion_feedback_does_not_poll_any_axis_sdo_objects(self):
+        """运动期禁止全部四轴反馈SDO访问，仍可凭TPDO1/2完成同帧触发和定位。"""
         runner = FourAxisReciprocationRunner(self.bus, self.settings, RunParameters(legs=1), self.rs06)
         def guarded(io):
             """保留非运动期SDO；模拟实机同步TPDO发送时反馈SDO不能可靠应答。"""
@@ -268,18 +286,86 @@ class FourAxisVirtualCanTests(unittest.TestCase):
                 return variable(index, subindex)
             return access
         with ExitStack() as stack:
-            for io in self.bus.axes:
+            for io in self.bus.axes + [self.bus.rs06_io]:
                 stack.enter_context(patch.object(io, '_variable', side_effect=guarded(io)))
             report = runner.run()
         self.assertTrue(report['success'])
         self.assertEqual(report['completed_legs'], 1)
         self.assertFalse(self.bus.feedback.changed)
+        self.assertEqual({comm for node, comm, _ in self.feedback_frames if node == 4}, {0x1800, 0x1801})
 
     def test_missing_tpdo_feedback_stops_every_axis(self):
         """节点1不再上报TPDO时按通信超时停止全部轴，不读旧缓存冒充正常运动。"""
         self.drop_feedback_node = 1
         runner = FourAxisReciprocationRunner(self.bus, self.settings, RunParameters(legs=1), self.rs06)
         with self.assertRaisesRegex(Exception, 'TPDO'):
+            runner.run()
+        self.assertTrue(all(sim.values[Object.CONTROLWORD] & CW_HALT for sim in self.sims[:3]))
+        self.assertEqual(self.sims[3].values[Object.CONTROLWORD], RS06_QUICK_STOP)
+        self.assertFalse(self.bus._cyclic_sync_active)
+
+    def _feedback_snapshot(self):
+        """读取四轴TPDO1/2的有效映射、COB-ID、类型及全部定时参数，用于恢复对照。"""
+        snapshots = []
+        for io in self.bus.axes + [self.bus.rs06_io]:
+            for comm in (0x1800, 0x1801):
+                count = io.read(comm + 0x200, 0)
+                subindices = (1, 2, 3, 5, 6) if io is self.bus.rs06_io else (1, 2, 3, 5)
+                snapshots.append((tuple(io.read(comm, sub) for sub in subindices),
+                                  tuple(io.read(comm + 0x200, sub) for sub in range(1, count + 1))))
+        return snapshots
+
+    def test_rs06_tpdo_configuration_is_temporary(self):
+        """非默认COB-ID、类型、禁止时间、事件周期及SYNC起始值均在停稳后恢复。"""
+        for comm, cob in ((0x1800, 0x384), (0x1801, 0x484)):
+            for sub, value, width in ((1, cob | PDO_DISABLED, 4), (2, 254, 1),
+                                      (3, 123, 2), (5, 456, 2), (6, 7, 1)):
+                self.locals[3].set_data(comm, sub, value.to_bytes(width, 'little'))
+        originals = self._feedback_snapshot()
+        runner = FourAxisReciprocationRunner(self.bus, self.settings, RunParameters(legs=2), self.rs06)
+        self.assertTrue(runner.run()['success'])
+        self.assertEqual(self._feedback_snapshot(), originals)
+        self.assertIsNone(self.bus.rs06_io.feedback_provider)
+        self.assertFalse(self.bus.feedback.subscriptions)
+
+    def test_rs06_tpdo_mapping_rejection_restores_all_feedback(self):
+        """RS06 TPDO2部分写入失败时，TPDO1及前三轴配置也恢复，且不使能运动。"""
+        originals = self._feedback_snapshot()
+        self.reject_rs_tpdo_mapping = True
+        runner = FourAxisReciprocationRunner(self.bus, self.settings, RunParameters(legs=1), self.rs06)
+        with self.assertRaises(TransportError):
+            runner.run()
+        self.assertEqual(self._feedback_snapshot(), originals)
+        self.assertFalse(self.releases)
+        self.assertFalse(any(index == Object.CONTROLWORD for sim in self.sims for index, _, _ in sim.writes))
+        self.assertFalse(self.bus.feedback.changed)
+        self.assertFalse(self.bus.feedback.subscriptions)
+
+    def test_rs06_feedback_cob_conflict_is_rejected_before_enable(self):
+        """另一轴TPDO占用RS06状态反馈ID时，配置拒绝且不触发运动。"""
+        self.locals[0].set_data(0x1802, 1, (0x184).to_bytes(4, 'little'))
+        runner = FourAxisReciprocationRunner(self.bus, self.settings, RunParameters(legs=1), self.rs06)
+        with self.assertRaisesRegex(TransportError, '占用反馈TPDO'):
+            runner.run()
+        self.assertFalse(self.releases)
+        self.assertFalse(self.bus.feedback.changed)
+
+    def test_missing_rs06_speed_feedback_stops_every_axis(self):
+        """RS06状态正常但速度帧缺失时也必须全组停止，不能退回SDO绕过超时。"""
+        self.drop_feedback_channel = (4, 0x1801)
+        runner = FourAxisReciprocationRunner(self.bus, self.settings, RunParameters(legs=1), self.rs06)
+        with self.assertRaisesRegex(Exception, '节点4.*TPDO'):
+            runner.run()
+        self.assertTrue(all(sim.values[Object.CONTROLWORD] & CW_HALT for sim in self.sims[:3]))
+        self.assertEqual(self.sims[3].values[Object.CONTROLWORD], RS06_QUICK_STOP)
+        self.assertFalse(self.bus._cyclic_sync_active)
+        self.assertFalse(self.bus.feedback.changed)
+
+    def test_missing_rs06_state_feedback_stops_every_axis(self):
+        """RS06位置/状态帧缺失时，即使速度仍更新也按通信失败联停。"""
+        self.drop_feedback_channel = (4, 0x1800)
+        runner = FourAxisReciprocationRunner(self.bus, self.settings, RunParameters(legs=1), self.rs06)
+        with self.assertRaisesRegex(Exception, '节点4.*TPDO'):
             runner.run()
         self.assertTrue(all(sim.values[Object.CONTROLWORD] & CW_HALT for sim in self.sims[:3]))
         self.assertEqual(self.sims[3].values[Object.CONTROLWORD], RS06_QUICK_STOP)

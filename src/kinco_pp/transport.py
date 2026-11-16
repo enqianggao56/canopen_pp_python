@@ -72,7 +72,10 @@ class CanopenTransport:
         return variable
 
     def read(self, index: int, subindex: int = 0) -> int:
-        """通过 SDO 返回整数原始值；通信、类型或对象错误抛 TransportError。"""
+        """返回整数原始值；运动反馈优先用已核对的TPDO缓存，其余走SDO。
+
+        缓存失效不降级为SDO；通信、反馈超时、类型或对象错误抛TransportError。
+        """
         if index == Object.ACTUAL_POSITION:
             # 控制层使用实际位置语义；Kinco手册列6063，RS06列6064，
             # 必须分别选择已核对坐标/单位的实际对象，不能跨型号硬套索引。

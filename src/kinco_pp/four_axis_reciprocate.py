@@ -150,8 +150,10 @@ class FourAxisBus(CanopenGroupBus):
                 io.write(SYNC_COB_OBJECT, SYNC_COB_ID)
                 if io.read(SYNC_COB_OBJECT) != SYNC_COB_ID:
                     raise TransportError(f'节点 {io.settings.node_id} SYNC地址回读不匹配')
-        self.feedback = CyclicFeedback(self.network, self.axes, self.axes+[self.rs06_io],
-                                       self.settings, lambda: self._cyclic_sync_active)
+        feedback_axes = self.axes + [self.rs06_io]
+        self.feedback = CyclicFeedback(self.network, feedback_axes, feedback_axes,
+                                       self.settings, lambda: self._cyclic_sync_active,
+                                       remap_state_axes=(self.rs06_io,))
         self.feedback.configure()
 
     def start_all(self):
@@ -250,6 +252,8 @@ class FourAxisBus(CanopenGroupBus):
             # 控制器随后继续向每台 Kinco 和 RS06 分别发送 SDO 停止请求。
             raise TransportError(f'RS06 停止请求失败，未发送 SYNC：{stop_error}') from stop_error
         self.sleep(self.rs06_settings.sync_settle_s)
+        if controlword & CW_NEW_SETPOINT:
+            self.feedback.reset()
         self._send(SYNC_COB_ID, b'')
         if controlword & CW_NEW_SETPOINT:
             self._motion_triggered = True

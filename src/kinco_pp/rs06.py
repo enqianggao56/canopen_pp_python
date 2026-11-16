@@ -37,6 +37,7 @@ class RS06Settings:
     hardware_verified 包含固件/EDS、CANopen 协议、停止方式及 acc_stutus=0 的
     人工确认；后者按手册 §4.2.10 使加速度兼作减速度，CANopen 表未说明其设置地址。
     本适配不猜测 0x6084 的单位，不写入该对象，也不修改私有协议参数。
+    synchronous_pdo_verified包含同步RPDO4及临时TPDO1/2槽位、COB-ID与SYNC核对。
     """
 
     eds: str = '../RS06.eds'
@@ -150,7 +151,10 @@ class RS06Peer:
 
     def __init__(self, io, settings, clock=time.monotonic, sleep=time.sleep,
                  enter_preoperational=None):
-        """注入SDO、配置、时钟及预操作态回调；实机同步PDO下状态控制也受SYNC门控。"""
+        """注入通信、配置、时钟及预操作态回调；运动期反馈由TPDO缓存提供。
+
+        准备/停止仍用SDO；实机同步PDO下状态控制也受SYNC门控。
+        """
         self.io, self.settings, self.clock, self.sleep = io, settings, clock, sleep
         self.enter_preoperational = enter_preoperational
         self.name = f'rs06/节点{settings.node_id}'
