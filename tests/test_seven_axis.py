@@ -81,7 +81,7 @@ class SevenAxisTests(unittest.TestCase):
             self.assertTrue(self.runner().run()['success'])
 
     def test_rs00_stop_failure_still_requests_both_el05(self):
-        """节点5停止通信失败不能跳过节点6/7，也不能恢复未确认的映射。"""
+        """节点5停止通信失败不能跳过节点6/7，最终停稳确认成功后恢复映射。"""
         io = self.bus.extra_ios[0]
         write = io.write
         def broken(index, value, subindex=0):
@@ -94,7 +94,7 @@ class SevenAxisTests(unittest.TestCase):
                 self.runner().run()
         self.assertTrue(all(axis.values[Object.CONTROLWORD] & CW_HALT for axis in self.bus.axes))
         self.assertEqual([axis.values[Object.CONTROLWORD] for axis in self.bus.extra_ios[1:]], [RS06_QUICK_STOP]*2)
-        self.assertFalse(self.bus.restored)
+        self.assertTrue(self.bus.restored)
 
     def test_last_axis_fault_stops_every_started_axis(self):
         """节点7运动期间故障进入全组停止，前三轴及其他伴随轴均收到停止。"""

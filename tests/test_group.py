@@ -127,10 +127,10 @@ class GroupTests(unittest.TestCase):
                 raise RuntimeError('node disconnected')
             write(index, value, subindex)
         with patch.object(self.bus.axes[0], 'write', side_effect=broken):
-            with self.assertRaisesRegex(GroupError, '三轴清理失败'):
+            with self.assertRaisesRegex(GroupError, '全组已确认停稳且临时 PDO 已恢复'):
                 self.controller.run()
         self.assertTrue(all(io.values[Object.CONTROLWORD] & CW_HALT for io in self.bus.axes[1:]))
-        self.assertFalse(self.bus.restored)
+        self.assertTrue(self.bus.restored)
 
     def test_keyboard_interrupt_requests_all_halts(self):
         """用户中断也要经完整的全组暂停和映射恢复路径。"""

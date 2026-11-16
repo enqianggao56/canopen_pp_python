@@ -16,7 +16,7 @@ from .group_transport import (CanopenGroupBus, SimulatedGroupBus, PDO_DISABLED,
 from .objects import CW_HALT, CW_NEW_SETPOINT, Object
 from .reciprocate import ReciprocationRunner
 from .rs06 import RS06Peer, SimulatedRS06
-from .transport import CanopenTransport, TransportError
+from .transport import CanopenTransport, TransportError, read_stop_configuration
 from .pdo_feedback import CyclicFeedback
 
 LOG = logging.getLogger(__name__)
@@ -190,11 +190,11 @@ class FourAxisBus(CanopenGroupBus):
         io = self.rs06_io if io is None else io
         io.node.nmt.state = 'PRE-OPERATIONAL'
         self.sleep(io.settings.poll_interval_s)
-        cob_id = io.read(self.comm_index, 1)
+        cob_id = read_stop_configuration(io, self.comm_index, 1, self.sleep)
         io.write(self.comm_index, cob_id | PDO_DISABLED, 1)
         io.write(self.comm_index, PDO_ASYNCHRONOUS, 2)
         self.sleep(io.settings.poll_interval_s)
-        if io.read(self.comm_index, 2) != PDO_ASYNCHRONOUS:
+        if read_stop_configuration(io, self.comm_index, 2, self.sleep) != PDO_ASYNCHRONOUS:
             raise TransportError(f'节点{io.settings.node_id} 停止/准备时关闭同步门控回读失败')
 
     def _start_rs06(self):

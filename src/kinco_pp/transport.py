@@ -1,6 +1,7 @@
 """CANopen SDO 适配层；使用真实 EDS 的数据类型读写，不自动重试运动写入。"""
 
 import logging
+import time
 from typing import Protocol
 
 from .model import Settings
@@ -147,3 +148,28 @@ class CanopenTransport:
                 self.node = None
         else:
             self.node = None
+
+
+def is_sdo_timeout(error):
+    """沿异常原因链识别 CANopen 无应答超时；中止码及其他通信错误不重试。"""
+    while error is not None:
+        if (type(error).__name__ == 'SdoCommunicationError'
+                and str(error) == 'No SDO response received'):
+            return True
+        error = error.__cause__
+    return False
+
+
+def read_stop_configuration(io, index, subindex, sleep=time.sleep):
+    """停止/准备配置只读确认，最多三次；每次受 SDO 超时限制，间隔50ms。
+
+    仅用于无副作用的 RPDO 通信参数读取；写入和运动触发不使用此重试。
+    """
+    for attempt in range(3):
+        try:
+            return io.read(index, subindex)
+        except Exception as exc:
+            if not is_sdo_timeout(exc) or attempt == 2:
+                raise
+            LOG.warning('配置回读超时，准备重试 %d/2：%s', attempt + 1, exc)
+            sleep(0.05)

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Tuple
 
 from .controller import DriveError, DriveTimeout, ProfilePositionController
+from .transport import is_sdo_timeout
 from .group_model import GroupPlan, GroupSettings, plan_group
 from .objects import (
     CW_ENABLE, CW_HALT, CW_NEW_SETPOINT, Object, PP_MODE,
@@ -106,6 +107,8 @@ class ThreeAxisController:
         不广播 Enable，以免尚未配置 PP 的轴被意外使能。通信停止不是硬件急停。
         """
         errors = []
+        self._all_halted = False
+        pending = []
         if self._broadcast_armed:
             try:
                 self._broadcast((self._last_controlword & ~CW_NEW_SETPOINT) | CW_HALT)
@@ -119,12 +122,32 @@ class ThreeAxisController:
                 controller.request_halt()
             except Exception as exc:
                 errors.append(f"轴 {name} 暂停请求: {exc}")
+                if is_sdo_timeout(exc):
+                    pending.append((name, controller))
+        # 第一轮先覆盖全组，再补发超时轴的停止请求；不重发广播/SYNC或运动目标。
+        for attempt in range(2):
+            if not pending:
+                break
+            self.sleep(0.05)
+            retry = []
+            for name, controller in pending:
+                try:
+                    controller.request_halt()
+                    LOG.warning('轴 %s 停止请求重试成功，保留首次异常并结束本次运行', name)
+                except Exception as exc:
+                    errors.append(f"轴 {name} 停止重试 {attempt + 1}/2: {exc}")
+                    if is_sdo_timeout(exc):
+                        retry.append((name, controller))
+            pending = retry
+        stop_errors = []
         for name, controller in stop_targets:
             try:
                 controller.wait_halted()
             except Exception as exc:
-                errors.append(f"轴 {name} 停稳确认: {exc}")
+                stop_errors.append(f"轴 {name} 停稳确认: {exc}")
         self._broadcast_armed = False
+        self._all_halted = not stop_errors
+        errors.extend(stop_errors)
         if errors:
             raise GroupError("; ".join(errors))
 
@@ -207,9 +230,11 @@ class ThreeAxisController:
                 self.halt_all()
             except Exception as exc:
                 errors.append(str(exc))
-            if not errors:
+            if not errors or getattr(self, "_all_halted", False):
                 try:
                     self.bus.restore()
+                    if errors:
+                        errors.append("全组已确认停稳且临时 PDO 已恢复；停止请求曾异常，本次运行退出")
                 except Exception as exc:
                     errors.append(str(exc))
             else:

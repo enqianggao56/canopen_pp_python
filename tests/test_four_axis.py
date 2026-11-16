@@ -155,7 +155,7 @@ class FourAxisTests(unittest.TestCase):
         self.assertTrue(all(io.values[Object.CONTROLWORD] & CW_HALT for io in self.bus.axes))
 
     def test_failed_first_halt_still_requests_other_axes(self):
-        """Kinco第一轴停止通信失败也不能跳过RS06；不得恢复未确认停稳的映射。"""
+        """Kinco第一轴停止通信失败也不能跳过RS06；最终停稳确认成功才恢复映射。"""
         write = self.bus.axes[0].write
         def broken(index, value, subindex=0):
             """共同触发后拒绝第一轴Halt，其他写入正常。"""
@@ -167,7 +167,7 @@ class FourAxisTests(unittest.TestCase):
                 self.runner().run()
         self.assertEqual(self.bus.rs06_io.values[Object.CONTROLWORD], RS06_QUICK_STOP)
         self.assertTrue(all(io.values[Object.CONTROLWORD] & CW_HALT for io in self.bus.axes[1:]))
-        self.assertFalse(self.bus.restored)
+        self.assertTrue(self.bus.restored)
 
     def test_duration_and_interrupt_stop_four_axes(self):
         """限时与Ctrl+C均完成四轴停止；截止前未触发时不补发运动。"""
