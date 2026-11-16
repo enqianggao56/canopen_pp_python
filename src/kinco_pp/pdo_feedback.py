@@ -1,8 +1,8 @@
-"""运动期Kinco/RS06周期PDO反馈；配置/停止后仍用SDO，避免TPDO与密集SDO应答竞争。
+"""运动期Kinco/RobStride周期PDO反馈；配置/停止后仍用SDO，避免TPDO与密集SDO应答竞争。
 
-Kinco校验既有TPDO1，RS06临时配置TPDO1：6041(16)+实际位置(32)+6061(8)。
+Kinco校验既有TPDO1，RobStride临时配置TPDO1：6041(16)+实际位置(32)+6061(8)。
 各轴临时TPDO2映射606C(32)，类型1随每次SYNC反馈。依据Kinco手册§9.3.3、
-RS06手册§5.2/§5.4及RS06.eds；位置/速度保留各厂家的原始单位。
+RS06/RS00/EL05手册§5.2/§5.4及共用RS06.eds；位置/速度保留各厂家的原始单位。
 """
 
 import time
@@ -19,7 +19,7 @@ class CyclicFeedback:
                  sleep=time.sleep, remap_state_axes=()):
         """注入反馈轴、总线全部轴及运动期判定；clock返回秒，不访问设备。
 
-        remap_state_axes指定需临时重映射TPDO1的轴（当前为RS06）；其余轴
+        remap_state_axes指定需临时重映射TPDO1的轴（RS06/RS00/EL05）；其余轴
         只校验既有TPDO1。全部反馈轴均临时配置TPDO2，异常由调用方联停并恢复。
         """
         self.network, self.axes, self.all_axes = network, axes, all_axes
@@ -61,7 +61,7 @@ class CyclicFeedback:
     def configure(self):
         """先读取全组快照和检查COB-ID，再配置TPDO；失败保留快照供停稳后恢复。
 
-        RS06的TPDO1/2使用0x180+节点号、0x280+节点号；清零禁止时间、事件定时器
+        RobStride的TPDO1/2使用0x180+节点号、0x280+节点号；清零禁止时间、事件定时器
         和SYNC起始值，保证无计数器SYNC可触发反馈，退出时恢复这些参数。
         """
         if self.changed or self.subscriptions:

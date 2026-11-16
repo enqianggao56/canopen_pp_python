@@ -19,38 +19,51 @@ from kinco_pp.simulation import SimulatedDrive
 from kinco_pp.transport import TransportError
 
 
-class FourAxisVirtualCanTests(unittest.TestCase):
-    """四个LocalNode模拟驱动，实际SDO编码和RPDO缓冲于同一SYNC生效。"""
+class MixedAxisVirtualFixture:
+    """共享四轴/七轴虚拟从站夹具；按真实映射响应SDO、缓存RPDO并生成TPDO。"""
+
+    kinco_config_path = 'config/reciprocate.example.json'
+
+    def companion_configs(self, channel):
+        """返回默认第四轴配置；七轴测试覆盖此方法增加三台独立从站。"""
+        return [replace(RS06Settings.load('config/rs06.example.json'),
+                        interface='virtual', channel=channel, synchronous_pdo_verified=True)]
+
+    def make_bus(self):
+        """构造默认四轴主站；子类可覆盖为七轴主站。"""
+        return FourAxisBus(self.settings, self.rs06)
 
     def setUp(self):
         """读取两种原始EDS，创建共享虚拟网络和动态状态对象。"""
         channel = str(uuid.uuid4())
-        source = GroupSettings.load('config/reciprocate.example.json')
+        source = GroupSettings.load(self.kinco_config_path)
         self.settings = replace(source, pdo_configuration_verified=True, axes=tuple(
             replace(axis, settings=replace(axis.settings, interface='virtual', channel=channel,
                                            sdo_timeout_s=0.2, absolute_reference_verified=True)) for axis in source.axes))
-        self.rs06 = replace(RS06Settings.load('config/rs06.example.json'),
-                            interface='virtual', channel=channel, synchronous_pdo_verified=True)
+        self.profiles = self.companion_configs(channel)
+        self.rs06 = self.profiles[0]
+        self.companion_ids = {config.node_id for config in self.profiles}
         self.server = canopen.Network()
         self.server.connect(interface='virtual', channel=channel)
         self.addCleanup(self.server.disconnect)
         self.locals, self.sims, self.pending, self.releases = [], [], {}, []
         self.reject_rs_mapping = False
-        self.pending_rs_controlword = None
-        self.rs_sync_armed = False
+        self.pending_rs_controlwords = {}
+        self.rs_sync_armed = set()
+        self.reject_mapping_node = 4
         self.legacy_control_collisions = 0
         self.drop_feedback_node = None
         self.drop_feedback_channel = None
         self.reject_rs_tpdo_mapping = False
         self.feedback_frames = []
-        configs = [axis.settings for axis in self.settings.axes] + [self.rs06]
+        configs = [axis.settings for axis in self.settings.axes] + list(self.profiles)
         for config in configs:
             local = canopen.LocalNode(config.node_id, config.eds)
             self.server.add_node(local)
-            sim = SimulatedRS06() if config.node_id == self.rs06.node_id else SimulatedDrive()
+            sim = SimulatedRS06() if config.node_id in self.companion_ids else SimulatedDrive()
             local.set_data(0x1603, 0, (1).to_bytes(1, 'little'))
             local.set_data(0x1603, 1, (PDO_CONTROLWORD_MAPPING).to_bytes(4, 'little'))
-            if config.node_id != self.rs06.node_id:
+            if config.node_id not in self.companion_ids:
                 local.set_data(0x1A00, 0, (3).to_bytes(1, 'little'))
                 for sub, mapping in enumerate(((int(Object.STATUSWORD)<<16)|16,
                         (config.actual_position_index<<16)|32, (int(Object.MODE_DISPLAY)<<16)|8), 1):
@@ -71,9 +84,10 @@ class FourAxisVirtualCanTests(unittest.TestCase):
             self.locals.append(local)
             self.sims.append(sim)
         self.server.subscribe(self.settings.shared_cob_id, self._receive_pdo)
-        self.server.subscribe(self.rs06.target_cob_id, self._receive_pdo)
+        for config in self.profiles:
+            self.server.subscribe(config.target_cob_id, self._receive_pdo)
         self.server.subscribe(SYNC_COB_ID, self._receive_sync)
-        self.bus = FourAxisBus(self.settings, self.rs06)
+        self.bus = self.make_bus()
         self.bus.open()
         self.addCleanup(self.bus.close)
 
@@ -87,6 +101,8 @@ class FourAxisVirtualCanTests(unittest.TestCase):
             key = (index, subindex) if subindex else index
             if index == Object.STATUSWORD:
                 return sim.read(index)
+            if index == 0x6063 and isinstance(sim, SimulatedDrive) and key not in sim.values:
+                return sim.values[Object.ACTUAL_POSITION]
             return sim.values.get(key) if index >= 0x6000 else None
         return read
 
@@ -94,27 +110,27 @@ class FourAxisVirtualCanTests(unittest.TestCase):
         """用真实EDS解码SDO，配置值仍保存在LocalNode。"""
         def write(index, subindex, od, data):
             """可注入第四轴映射拒绝，验证前三轴已修改映射也会恢复。"""
-            if local.id == 4 and index == 0x1603 and subindex == 1 and self.reject_rs_mapping:
+            if local.id == self.reject_mapping_node and index == 0x1603 and subindex == 1 and self.reject_rs_mapping:
                 self.reject_rs_mapping = False
                 raise canopen.sdo.SdoAbortedError(0x06040041)
-            if local.id == 4 and index == 0x1A01 and subindex == 1 and self.reject_rs_tpdo_mapping:
+            if local.id == self.reject_mapping_node and index == 0x1A01 and subindex == 1 and self.reject_rs_tpdo_mapping:
                 self.reject_rs_tpdo_mapping = False
                 raise canopen.sdo.SdoAbortedError(0x06040041)
-            if local.id != 4 and index == 0x1006 and od.decode_raw(data) == 0:
+            if local.id not in self.companion_ids and index == 0x1006 and od.decode_raw(data) == 0:
                 # 实机Kinco不接受0周期；不能在运动前强制改为0。
                 raise canopen.sdo.SdoAbortedError(0x06090030)
             if index >= 0x6000:
-                if local.id == 4 and index == Object.CONTROLWORD:
-                    self.rs_sync_armed = False
+                if local.id in self.companion_ids and index == Object.CONTROLWORD:
+                    self.rs_sync_armed.discard(local.id)
                     transmission = int.from_bytes(local.get_data(0x1403, 2), 'little')
                     if transmission == 1:
                         # 复现实机：同步PDO门控下，即使在预操作态，SDO控制字读回已更新，
                         # 实际状态直到SYNC才变化，旧版准备流程会在此超时。
-                        self.pending_rs_controlword = od.decode_raw(data)
-                        sim.values[index] = self.pending_rs_controlword
-                        sim.writes.append((index, self.pending_rs_controlword, subindex))
+                        self.pending_rs_controlwords[local.id] = od.decode_raw(data)
+                        sim.values[index] = self.pending_rs_controlwords[local.id]
+                        sim.writes.append((index, self.pending_rs_controlwords[local.id], subindex))
                         return
-                    self.pending_rs_controlword = None
+                    self.pending_rs_controlwords.pop(local.id, None)
                 sim.write(index, od.decode_raw(data), subindex)
         return write
 
@@ -124,7 +140,7 @@ class FourAxisVirtualCanTests(unittest.TestCase):
             cob_id = int.from_bytes(local.get_data(0x1403, 1), 'little')
             transmission = int.from_bytes(local.get_data(0x1403, 2), 'little')
             if cob_id == can_id and transmission == 1 and local.nmt.state == 'OPERATIONAL':
-                if local.id == 4 and not self.rs_sync_armed:
+                if local.id in self.companion_ids and local.id not in self.rs_sync_armed:
                     # 实机进入OP后的首条SYNC先初始化接收通道，之前的PDO被忽略。
                     continue
                 self.pending[local.id] = bytes(data)
@@ -132,17 +148,17 @@ class FourAxisVirtualCanTests(unittest.TestCase):
     def _receive_sync(self, can_id, data, timestamp):
         """以同一接收时间释放两类RPDO，并记录新目标触发时四轴是否同时待处理。"""
         starts = [node for node, frame in self.pending.items()
-                  if node != 4 and int.from_bytes(frame, 'little') & CW_NEW_SETPOINT]
+                  if node not in self.companion_ids and int.from_bytes(frame, 'little') & CW_NEW_SETPOINT]
         if starts:
             self.releases.append((tuple(sorted(self.pending)), timestamp))
             for local in self.locals[:3]:
                 if not int.from_bytes(local.get_data(0x1400, 1), 'little') & PDO_DISABLED:
                     self.legacy_control_collisions += 1
-        if self.locals[3].nmt.state == 'OPERATIONAL':
-            self.rs_sync_armed = True
-        if self.pending_rs_controlword is not None and self.locals[3].nmt.state == 'OPERATIONAL':
-            self.sims[3].write(Object.CONTROLWORD, self.pending_rs_controlword)
-            self.pending_rs_controlword = None
+        for local, sim in zip(self.locals, self.sims):
+            if local.id in self.companion_ids and local.nmt.state == 'OPERATIONAL':
+                self.rs_sync_armed.add(local.id)
+                if local.id in self.pending_rs_controlwords:
+                    sim.write(Object.CONTROLWORD, self.pending_rs_controlwords.pop(local.id))
         for local, sim in zip(self.locals, self.sims):
             if local.id not in self.pending:
                 continue
@@ -177,11 +193,18 @@ class FourAxisVirtualCanTests(unittest.TestCase):
                         continue
                     variable = local.object_dictionary[index]
                     key = (index, object_sub) if object_sub else index
-                    value = sim.values[key]
+                    if index == 0x6063 and isinstance(sim, SimulatedDrive) and key not in sim.values:
+                        value = sim.values[Object.ACTUAL_POSITION]
+                    else:
+                        value = sim.values[key]
                     payload += variable.encode_raw(value)[:bits // 8]
                 if payload:
                     self.feedback_frames.append((local.id, comm_index, payload))
                     self.server.send_message(cob_id & 0x7FF, payload)
+
+
+class FourAxisVirtualCanTests(MixedAxisVirtualFixture, unittest.TestCase):
+    """四个LocalNode模拟驱动，实际SDO编码和RPDO缓冲于同一SYNC生效。"""
 
     def test_four_eds_nodes_share_network_and_start_on_same_sync(self):
         """验证身份、100RPM真实编解码、共同SYNC、正反两程和四轴原配置恢复。"""

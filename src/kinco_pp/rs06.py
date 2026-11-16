@@ -1,6 +1,7 @@
 """RobStride RS06 CANopen PP 适配；依据 RS06 手册 §5.3、§5.4、§5.6。
 
 位置每圈 16384 inc，速度 0.1 rpm，加速度 0.1 rpm/s；不能使用 Kinco 换算。
+RS00/EL05手册§5.3/§5.4/§5.6逐项一致的PP流程由本模块复用；力矩与设备校验独立配置。
 PP 在控制字 15 下更新绝对位置即可运行，不使用 bit4/bit12 握手。
 """
 
@@ -157,7 +158,7 @@ class RS06Peer:
         """
         self.io, self.settings, self.clock, self.sleep = io, settings, clock, sleep
         self.enter_preoperational = enter_preoperational
-        self.name = f'rs06/节点{settings.node_id}'
+        self.name = f"{getattr(settings, 'model', 'RS06').lower()}/节点{settings.node_id}"
         self.enable_started = False
         self.prepared = False
         self.triggered_at = None
@@ -197,7 +198,7 @@ class RS06Peer:
         量化可能产生模型时差，由四轴报告单独输出，不能当作实测精度。
         """
         if target not in (self.settings.origin_position_inc, self.settings.far_position_inc):
-            raise ValueError('RS06 目标必须为已确认固定端点')
+            raise ValueError(f'{self.name} 目标必须为已确认固定端点')
         current = self.check()['start_position_inc'] if start_position_inc is None else start_position_inc
         self._check_position(current)
         self.target = target
@@ -209,7 +210,7 @@ class RS06Peer:
                                   acceleration_cap / 600, acceleration_cap / 600)
         common = minimum if common_duration_s is None else common_duration_s
         if common + 1e-9 < minimum:
-            raise ValueError('共同时间短于 RS06 最快可行轮廓')
+            raise ValueError(f'共同时间短于 {self.name} 最快可行轮廓')
         if distance:
             scale = min(1, minimum / common)
             acceleration = min(acceleration_cap, max(1, math.ceil(acceleration_cap * scale * scale)))
@@ -224,7 +225,7 @@ class RS06Peer:
         else:
             duration = 0.0
         if duration >= self.settings.motion_timeout_s:
-            raise ValueError('RS06 轮廓估算时间超过 motion_timeout_s')
+            raise ValueError(f'{self.name} 轮廓估算时间超过 motion_timeout_s')
         self.estimated_duration_s = duration
         return duration
 

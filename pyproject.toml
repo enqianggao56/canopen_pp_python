@@ -15,6 +15,7 @@ kinco-pp = "kinco_pp.cli:main"
 kinco-pp-group = "kinco_pp.group_cli:main"
 kinco-pp-reciprocate = "kinco_pp.reciprocate:main"
 kinco-pp-four-axis = "kinco_pp.four_axis_reciprocate:main"
+kinco-pp-seven-axis = "kinco_pp.seven_axis_reciprocate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

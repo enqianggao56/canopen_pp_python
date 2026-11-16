@@ -1,7 +1,7 @@
-"""三台 Kinco 加 RS06 的四轴 PP 往返：共同 SYNC 启动，共同时间规划和全组停止。
+"""三台Kinco与RobStride伴随轴的PP往返；保留原四轴入口，七轴复用本模块。
 
-RS06 不加入 Kinco 控制字映射，而在独立同步 RPDO 中接收绝对目标。
-原三轴仍接收同一条共享控制字 RPDO；两个命令帧装载完毕后发送一次 SYNC。
+RobStride伴随轴不加入Kinco控制字映射，而在独立同步 RPDO 中接收绝对目标。
+原三轴仍接收同一条共享控制字RPDO；全部伴随轴目标装载完毕后发送一次SYNC。
 """
 
 import logging
@@ -10,12 +10,12 @@ import time
 from dataclasses import replace
 
 from .group_controller import ThreeAxisController
-from .group_model import plan_group, profile_time
+from .group_model import plan_group
 from .group_transport import (CanopenGroupBus, SimulatedGroupBus, PDO_DISABLED,
                               PDO_SYNCHRONOUS, PDO_ASYNCHRONOUS)
 from .objects import CW_HALT, CW_NEW_SETPOINT, Object
 from .reciprocate import ReciprocationRunner
-from .rs06 import RS06Peer, SimulatedRS06, RS06_COUNTS_PER_REV
+from .rs06 import RS06Peer, SimulatedRS06
 from .transport import CanopenTransport, TransportError
 from .pdo_feedback import CyclicFeedback
 
@@ -29,33 +29,38 @@ TARGET_POSITION_MAPPING = (int(Object.TARGET_POSITION) << 16) | 32
 ABSOLUTE_POSITION_TIME_MARGIN_S = 0.0001
 
 
-def validate_topology(settings, rs06):
-    """只校验四轴唯一节点、总线及固定起点，不连接设备；错误抛 ValueError。"""
-    if rs06.node_id in {axis.settings.node_id for axis in settings.axes}:
-        raise ValueError('RS06 节点 ID 与 Kinco 重复')
-    if rs06.target_cob_id == settings.shared_cob_id:
-        raise ValueError('RS06 目标 RPDO 与 Kinco 控制字不能使用相同 COB-ID')
-    for axis in settings.axes:
-        config = axis.settings
-        if (config.interface, config.channel, config.bitrate) != (rs06.interface, rs06.channel, rs06.bitrate):
-            raise ValueError('四轴必须使用相同 CAN 接口、通道和波特率')
-        if axis.origin_position_inc is None:
-            raise ValueError('四轴往返必须逐轴配置固定 origin_position_inc')
+def validate_topology(settings, rs06, extra_settings=()):
+    """只校验全部轴唯一节点、独立目标COB-ID、共用总线及固定起点，不访问设备。"""
+    companions = (rs06,) + tuple(extra_settings)
+    nodes = [axis.settings.node_id for axis in settings.axes] + [axis.node_id for axis in companions]
+    if len(nodes) != len(set(nodes)):
+        raise ValueError('RobStride 节点 ID 与其他轴重复')
+    cob_ids = [settings.shared_cob_id] + [axis.target_cob_id for axis in companions]
+    if len(cob_ids) != len(set(cob_ids)):
+        raise ValueError('各轴目标 RPDO 与 Kinco 控制字不能使用相同 COB-ID')
+    bus = (rs06.interface, rs06.channel, rs06.bitrate)
+    for config in [axis.settings for axis in settings.axes] + list(companions):
+        if (config.interface, config.channel, config.bitrate) != bus:
+            raise ValueError('全部轴必须使用相同 CAN 接口、通道和波特率')
+    if any(axis.origin_position_inc is None for axis in settings.axes):
+        raise ValueError('混合多轴往返必须逐轴配置固定 origin_position_inc')
 
 
 class FourAxisBus(CanopenGroupBus):
-    """借用同一个 CANopen Network；保存四轴映射及 SYNC 周期，停稳后恢复。"""
+    """共享CANopen网络管理三台Kinco及1至4台RobStride，停稳后恢复配置。"""
 
-    def __init__(self, settings, rs06, sleep=time.sleep):
-        """保存两种设备配置；不连接设备，不修改 PDO。"""
-        validate_topology(settings, rs06)
+    def __init__(self, settings, rs06, sleep=time.sleep, extra_settings=()):
+        """保存Kinco与逐轴RobStride配置；不连接设备，不修改PDO。"""
+        validate_topology(settings, rs06, extra_settings)
         super().__init__(settings)
         self.rs06_settings, self.sleep = rs06, sleep
         # 先用异步通道完成SDO状态/定位方式锁存，全部装载后再统一切为同步。
         self.transmission_type = PDO_ASYNCHRONOUS
+        self.extra_settings = tuple(extra_settings)
+        self.extra_ios, self.extra_peers = [], []
         self.rs06_io = None
         self.peer = None
-        self._rs_changed = None
+        self._rs_changed = []
         self._sync_changed = []
         self._other_rpdo_changed = []
         self._cyclic_sync_active = False
@@ -63,30 +68,44 @@ class FourAxisBus(CanopenGroupBus):
         self.sync_period_s = None
         self.feedback = None
 
+    @property
+    def robstride_ios(self):
+        """按配置顺序返回RS06及新增轴的通信对象。"""
+        return [self.rs06_io] + self.extra_ios
+
+    @property
+    def robstride_peers(self):
+        """返回全部伴随控制器，用于共同装载和逐轴停止。"""
+        return [self.peer] + self.extra_peers
+
     def open(self):
-        """连接共享网络，再添加节点4；任何失败释放连接，不发送状态/运动命令。"""
+        """添加所有节点到共享网络；任何失败释放连接，不发送状态/运动命令。"""
         try:
             super().open()
             self.rs06_io = CanopenTransport(self.rs06_settings, network=self.network)
             self.rs06_io.open()
+            for config in self.extra_settings:
+                io = CanopenTransport(config, network=self.network)
+                self.extra_ios.append(io)
+                io.open()
         except Exception:
             self.close()
             raise
 
     def verify_identities(self):
-        """只读核对四台设备与各自 EDS 身份；RS06 失败不允许三轴先运行。"""
-        return super().verify_identities() + (self.rs06_io.verify_identity(),)
+        """只读核对全部设备与各自EDS身份；任一轴失败不允许其余轴先运行。"""
+        return super().verify_identities() + tuple(io.verify_identity() for io in self.robstride_ios)
 
     def check_sync_configuration(self):
-        """只读检查四轴 SYNC COB-ID 和 PDO 冲突，返回 RS06 原始映射快照。
+        """只读检查全部轴SYNC/目标PDO冲突，返回各RobStride IO及原映射快照。
 
-        要求 Kinco 0x1005=0x80；RS06 允许初始0，运行时临时设为0x80并回读。
+        要求Kinco 0x1005=0x80；RobStride允许初始0，运行时临时设为0x80并回读。
         所有轴必须作为消费者、不自行产生SYNC；现场还须确认没有其他
         SYNC 主站。不能靠 SDO 检查证明总线独占性。
         """
-        snapshots = self._snapshot(self.rs06_io)
-        for io in self.axes + [self.rs06_io]:
-            allowed = (0, SYNC_COB_ID) if io is self.rs06_io else (SYNC_COB_ID,)
+        snapshots = [(io, self._snapshot(io)) for io in self.robstride_ios]
+        for io in self.axes + self.robstride_ios:
+            allowed = (0, SYNC_COB_ID) if io in self.robstride_ios else (SYNC_COB_ID,)
             if io.read(SYNC_COB_OBJECT) not in allowed:
                 raise TransportError(f'节点 {io.settings.node_id} 的 0x1005 必须为 0x80 消费者')
             io.read(SYNC_PERIOD_OBJECT)
@@ -97,21 +116,21 @@ class FourAxisBus(CanopenGroupBus):
                     continue
                 cob_id = io.read(index, 1)
                 if not cob_id & PDO_DISABLED and cob_id & 0x1FFFFFFF in (
-                        self.settings.shared_cob_id, self.rs06_settings.target_cob_id):
-                    raise TransportError(f'节点 {io.settings.node_id} 的其他 PDO 占用四轴预留 COB-ID')
+                        self.settings.shared_cob_id, *(axis.settings.target_cob_id for axis in self.robstride_ios)):
+                    raise TransportError(f'节点 {io.settings.node_id} 的其他 PDO 占用全组预留 COB-ID')
         return snapshots
 
     def configure(self):
         """预先完成全组冲突读取，再配置同步 RPDO；失败保留快照供全组清理恢复。"""
-        if not self.rs06_settings.synchronous_pdo_verified:
-            raise TransportError('须确认 RS06 同步 RPDO、SYNC 独占及槽位后设置 synchronous_pdo_verified')
-        if (self._rs_changed is not None or self._sync_changed or self._other_rpdo_changed
+        if not all(config.synchronous_pdo_verified for config in (self.rs06_settings,) + self.extra_settings):
+            raise TransportError('须逐轴确认 RobStride 同步 RPDO/TPDO、SYNC 独占及槽位后设置 synchronous_pdo_verified')
+        if (self._rs_changed or self._sync_changed or self._other_rpdo_changed
                 or (self.feedback is not None and (self.feedback.changed or self.feedback.subscriptions))):
-            raise TransportError('四轴仍有未恢复配置，拒绝重复映射')
-        snapshot = self.check_sync_configuration()
+            raise TransportError('全组仍有未恢复配置，拒绝重复映射')
+        snapshots = self.check_sync_configuration()
         # 保留的旧RPDO1可能也映射607A/6060/6040。共同SYNC前先暂时禁用
         # 其他写入这些对象的RPDO，避免多个通道向同一控制对象送入旧过程数据。
-        for io in self.axes + [self.rs06_io]:
+        for io in self.axes + self.robstride_ios:
             for index in io.node.object_dictionary:
                 if not 0x1400 <= index <= 0x1407 or index == self.comm_index:
                     continue
@@ -133,14 +152,15 @@ class FourAxisBus(CanopenGroupBus):
                     if io.read(index, 2) != PDO_ASYNCHRONOUS:
                         raise TransportError(f'节点{io.settings.node_id} 其他控制RPDO关闭同步门控失败')
         super().configure()
-        self._rs_changed = snapshot
-        self.rs06_io.node.nmt.state = 'PRE-OPERATIONAL'
-        self.sleep(self.rs06_settings.poll_interval_s)
-        expected = (self.rs06_settings.target_cob_id, PDO_SYNCHRONOUS, (TARGET_POSITION_MAPPING,))
-        self._write_mapping(self.rs06_io, *expected)
-        if self._snapshot(self.rs06_io) != expected:
-            raise TransportError('RS06 同步目标 RPDO 回读不匹配')
-        for io in self.axes + [self.rs06_io]:
+        for io, snapshot in snapshots:
+            self._rs_changed.append((io, snapshot))
+            io.node.nmt.state = 'PRE-OPERATIONAL'
+            self.sleep(io.settings.poll_interval_s)
+            expected = (io.settings.target_cob_id, PDO_SYNCHRONOUS, (TARGET_POSITION_MAPPING,))
+            self._write_mapping(io, *expected)
+            if self._snapshot(io) != expected:
+                raise TransportError(f'节点{io.settings.node_id} 同步目标 RPDO 回读不匹配')
+        for io in self.axes + self.robstride_ios:
             # 保留实机现有SYNC周期。Kinco当前固件不接受1006=0，不能
             # 通过忽略回读差异来继续；PP共同触发只改变RPDO类型和必要的SYNC地址。
             original = io.read(SYNC_PERIOD_OBJECT)
@@ -150,44 +170,46 @@ class FourAxisBus(CanopenGroupBus):
                 io.write(SYNC_COB_OBJECT, SYNC_COB_ID)
                 if io.read(SYNC_COB_OBJECT) != SYNC_COB_ID:
                     raise TransportError(f'节点 {io.settings.node_id} SYNC地址回读不匹配')
-        feedback_axes = self.axes + [self.rs06_io]
+        feedback_axes = self.axes + self.robstride_ios
         self.feedback = CyclicFeedback(self.network, feedback_axes, feedback_axes,
                                        self.settings, lambda: self._cyclic_sync_active,
-                                       remap_state_axes=(self.rs06_io,))
+                                       remap_state_axes=self.robstride_ios)
         self.feedback.configure()
 
     def start_all(self):
-        """启动Kinco；RS06保持预操作态完成SDO准备，到共同触发前才切入运行态。"""
+        """启动Kinco；全部RobStride保持预操作态完成SDO准备，到共同触发前才切入运行态。"""
         super().start_all()
 
-    def rs06_preoperational(self):
-        """进入预操作态并关闭RS06同步门控，使SDO状态控制立即生效。
+    def rs06_preoperational(self, io=None):
+        """为指定RobStride IO进入预操作态并关闭同步门控，使SDO状态控制立即生效。
 
-        实机即使在NMT预操作态，传输类型1仍会让SDO控制字等待SYNC。
+        RS06实机即使在NMT预操作态，传输类型1仍会让SDO控制字等待SYNC。
         因此先禁用目标RPDO，再改回异步254；不恢复原映射、不发SYNC或位置目标。
         仅在共同启动前重启同步映射，停止时保持通道禁用至确认全组静止。
         """
-        self.rs06_io.node.nmt.state = 'PRE-OPERATIONAL'
-        self.sleep(self.rs06_settings.poll_interval_s)
-        cob_id = self.rs06_io.read(self.comm_index, 1)
-        self.rs06_io.write(self.comm_index, cob_id | PDO_DISABLED, 1)
-        self.rs06_io.write(self.comm_index, PDO_ASYNCHRONOUS, 2)
-        self.sleep(self.rs06_settings.poll_interval_s)
-        if self.rs06_io.read(self.comm_index, 2) != PDO_ASYNCHRONOUS:
-            raise TransportError('RS06停止/准备时关闭同步门控回读失败')
+        io = self.rs06_io if io is None else io
+        io.node.nmt.state = 'PRE-OPERATIONAL'
+        self.sleep(io.settings.poll_interval_s)
+        cob_id = io.read(self.comm_index, 1)
+        io.write(self.comm_index, cob_id | PDO_DISABLED, 1)
+        io.write(self.comm_index, PDO_ASYNCHRONOUS, 2)
+        self.sleep(io.settings.poll_interval_s)
+        if io.read(self.comm_index, 2) != PDO_ASYNCHRONOUS:
+            raise TransportError(f'节点{io.settings.node_id} 停止/准备时关闭同步门控回读失败')
 
     def _start_rs06(self):
-        """RS06已在预操作态使能并保持当前位置后，切入运行态接收同步目标。"""
-        expected = (self.rs06_settings.target_cob_id, PDO_SYNCHRONOUS, (TARGET_POSITION_MAPPING,))
-        self._write_mapping(self.rs06_io, *expected)
-        if self._snapshot(self.rs06_io) != expected:
-            raise TransportError('RS06共同触发前同步映射回读失败')
-        self.rs06_io.start()
-        self.sleep(self.rs06_settings.poll_interval_s)
-        # 当前Revision0x500实机进入OP后需先收到一条初始化SYNC，
-        # 才接收后续同步RPDO。此时Kinco仍为Halt，尚未发送任何新目标帧。
+        """全部伴随轴已使能保持当前位置，再统一进入运行态并初始化同步接收。"""
+        for io in self.robstride_ios:
+            expected = (io.settings.target_cob_id, PDO_SYNCHRONOUS, (TARGET_POSITION_MAPPING,))
+            self._write_mapping(io, *expected)
+            if self._snapshot(io) != expected:
+                raise TransportError(f'节点{io.settings.node_id} 共同触发前同步映射回读失败')
+            io.start()
+        self.sleep(max(io.settings.poll_interval_s for io in self.robstride_ios))
+        # RS06 Revision0x500实机要求初始化SYNC；新型号共用EDS但仍须实机核对。
+        # 全部伴随轴进入OP后统一初始化，此时Kinco仍Halt且没有装载任何新目标。
         self._send(SYNC_COB_ID, b'')
-        self.sleep(self.rs06_settings.poll_interval_s)
+        self.sleep(max(io.settings.poll_interval_s for io in self.robstride_ios))
 
     def _arm_kinco_sync(self, controlword):
         """三轴定位方式及目标已在异步准备阶段锁存后，切为同一同步控制字通道。"""
@@ -206,8 +228,7 @@ class FourAxisBus(CanopenGroupBus):
         """发送有界等待的标准帧；不重试目标或 SYNC，以免重复不确定命令。"""
         import can
         self.network.check()
-        timeout = min(self.rs06_settings.sdo_timeout_s,
-                      *(axis.settings.sdo_timeout_s for axis in self.settings.axes))
+        timeout = min(io.settings.sdo_timeout_s for io in self.axes + self.robstride_ios)
         message = can.Message(arbitration_id=cob_id, is_extended_id=False, data=data)
         with self.network.send_lock:
             self.network.bus.send(message, timeout=timeout)
@@ -222,36 +243,38 @@ class FourAxisBus(CanopenGroupBus):
         """新目标已共同触发后立即按设备原周期维持同步通信，覆盖PP应答阶段。"""
         if not self._cyclic_sync_active:
             periods = [period / 1000000 for _, period, _ in self._sync_changed if period > 0]
-            self.sync_period_s = min(periods) if periods else self.rs06_settings.poll_interval_s
+            self.sync_period_s = min(periods) if periods else min(io.settings.poll_interval_s for io in self.robstride_ios)
             self.network.sync.start(self.sync_period_s)
             self._cyclic_sync_active = True
 
     def broadcast(self, controlword):
-        """装载两种命令后统一 SYNC；停止时先停止 RS06，避免释放残留待处理目标。
+        """装载Kinco控制字及全部伴随目标后统一SYNC；停止时先逐轴停止RobStride，避免释放残留待处理目标。
 
         CAN 发帧后等待配置的发送余量再发高优先级 SYNC，避免 SYNC 抢先。
         余量依赖总线负载，必须实机核对；不是硬实时发送完成保证。
         """
-        if self.peer is None:
-            raise TransportError('RS06 伴随控制器尚未绑定')
-        stop_error = None
+        if any(peer is None for peer in self.robstride_peers) or len(self.robstride_peers) != len(self.robstride_ios):
+            raise TransportError('RobStride 伴随控制器尚未全部绑定')
+        stop_errors = []
         if controlword & CW_HALT:
             self._stop_cyclic_sync()
             self._motion_triggered = False
-            try:
-                self.peer.request_halt()
-            except Exception as exc:
-                stop_error = exc
+            for peer in self.robstride_peers:
+                try:
+                    peer.request_halt()
+                except Exception as exc:
+                    stop_errors.append(f'{peer.name}: {exc}')
         elif controlword & CW_NEW_SETPOINT:
             self._arm_kinco_sync(controlword)
             self._start_rs06()
-            self._send(self.rs06_settings.target_cob_id, self.peer.target.to_bytes(4, 'little', signed=True))
+            for peer in self.robstride_peers:
+                self._send(peer.settings.target_cob_id, peer.target.to_bytes(4, 'little', signed=True))
         super().broadcast(controlword)
-        if stop_error is not None:
-            # 仍发送 Kinco Halt RPDO，但不以 SYNC 释放未确认停止的 RS06 残留目标。
-            # 控制器随后继续向每台 Kinco 和 RS06 分别发送 SDO 停止请求。
-            raise TransportError(f'RS06 停止请求失败，未发送 SYNC：{stop_error}') from stop_error
-        self.sleep(self.rs06_settings.sync_settle_s)
+        if stop_errors:
+            # 仍发送 Kinco Halt RPDO，但不以 SYNC 释放未确认停止的RobStride残留目标。
+            # 控制器随后继续向每台Kinco和RobStride 分别发送 SDO 停止请求。
+            raise TransportError('RobStride 停止请求失败，未发送 SYNC：' + '; '.join(stop_errors))
+        self.sleep(max(io.settings.sync_settle_s for io in self.robstride_ios))
         if controlword & CW_NEW_SETPOINT:
             self.feedback.reset()
         self._send(SYNC_COB_ID, b'')
@@ -272,16 +295,18 @@ class FourAxisBus(CanopenGroupBus):
             super().restore()
         except Exception as exc:
             errors.append(str(exc))
-        if self._rs_changed is not None:
+        failed_targets = []
+        for io, snapshot in reversed(self._rs_changed):
             try:
-                self.rs06_io.node.nmt.state = 'PRE-OPERATIONAL'
-                self._write_mapping(self.rs06_io, *self._rs_changed)
-                if self._snapshot(self.rs06_io) != self._rs_changed:
-                    raise TransportError('RS06 原映射回读不匹配')
-                self.rs06_io.start()
-                self._rs_changed = None
+                io.node.nmt.state = 'PRE-OPERATIONAL'
+                self._write_mapping(io, *snapshot)
+                if self._snapshot(io) != snapshot:
+                    raise TransportError('原目标RPDO映射回读不匹配')
+                io.start()
             except Exception as exc:
-                errors.append(f'RS06 映射恢复：{exc}')
+                failed_targets.append((io, snapshot))
+                errors.append(f'节点{io.settings.node_id} 目标RPDO恢复：{exc}')
+        self._rs_changed = failed_targets
         failed = []
         for io, original, original_cob_id in self._sync_changed:
             try:
@@ -314,7 +339,7 @@ class FourAxisBus(CanopenGroupBus):
             except Exception as exc:
                 errors.append(str(exc))
         if errors:
-            raise TransportError('四轴配置恢复失败：' + '; '.join(errors))
+            raise TransportError('混合多轴配置恢复失败：' + '; '.join(errors))
 
     def close(self):
         """释放连接前停止后台SYNC；驱动器停止仍由控制器负责。"""
@@ -325,81 +350,104 @@ class FourAxisBus(CanopenGroupBus):
 
 
 class SimulatedFourAxisBus(SimulatedGroupBus):
-    """四轴协议模拟；保留三个 Kinco 的共同帧，RS06 仅接收自己的绝对目标。"""
+    """混合轴协议模拟；保留三台Kinco共同帧，每台RobStride接收自己的绝对目标。"""
 
-    def __init__(self, initial_positions=(0, 0, 0), rs06_position=0):
-        """初始化独立 RS06 模拟器；events 记录同一逻辑 SYNC 的四轴释放。"""
+    def __init__(self, initial_positions=(0, 0, 0), rs06_position=0, extra_positions=()):
+        """按inc初始化独立伴随轴；events兼容四轴，companion_events记录全部伴随目标。"""
         super().__init__(initial_positions)
         self.rs06_io = SimulatedRS06(rs06_position)
+        self.extra_ios = [SimulatedRS06(position) for position in extra_positions]
+        self.extra_peers = []
         self.peer = None
         self.events = []
+        self.companion_events = []
 
     def broadcast(self, controlword):
         """模拟同步装载和释放；不模拟真实总线帧发送延迟或机械运动时间。"""
         if controlword & CW_HALT:
-            self.peer.request_halt()
+            errors = []
+            for peer in [self.peer] + self.extra_peers:
+                try:
+                    peer.request_halt()
+                except Exception as exc:
+                    errors.append(f'{peer.name}: {exc}')
+            super().broadcast(controlword)
+            if errors:
+                raise TransportError('; '.join(errors))
+            return
         super().broadcast(controlword)
         if controlword & CW_NEW_SETPOINT and not controlword & CW_HALT:
-            self.rs06_io.write(Object.TARGET_POSITION, self.peer.target)
+            for peer in [self.peer] + self.extra_peers:
+                peer.io.write(Object.TARGET_POSITION, peer.target)
+            self.companion_events.append(tuple(peer.target for peer in [self.peer] + self.extra_peers))
             self.events.append(('sync_start', tuple(io.target for io in self.axes), self.peer.target))
 
 
 class FourAxisController(ThreeAxisController):
-    """补充四轴轮询观察时差；三轴仍由基类统一装载、握手与联停。"""
+    """补充全部轴的轮询观察时差；三台Kinco仍由基类统一装载、握手与联停。"""
 
     def run(self):
-        """正常完成时返回原三轴结果，并记录包含 RS06 到位确认的主机观察时差。"""
+        """正常完成返回原三轴结果，主机观察时差同时计入所有有位移的伴随轴。"""
         starts = tuple(io.read(Object.ACTUAL_POSITION) for io in self.bus.axes)
         result = super().run()
-        peer = self.peers[0]
         arrivals = [arrival for arrival, axis, start in zip(result.observed_arrival_times_s, result.plan.axes, starts)
                     if abs(axis.end_inc-start) > axis.axis.settings.position_tolerance_inc]
-        if peer.has_motion:
-            arrivals.append(peer.arrived_at)
-        self.four_axis_observed_spread_s = max(arrivals) - min(arrivals) if arrivals else 0.0
+        arrivals.extend(peer.arrived_at for peer in self.peers if peer.has_motion)
+        self.axis_observed_spread_s = max(arrivals) - min(arrivals) if arrivals else 0.0
         return result
 
 
 class FourAxisReciprocationRunner(ReciprocationRunner):
-    """四轴每程共同开始、按共同时间规划，全部到位和停稳后换向。"""
+    """混合多轴每程共同开始并按共同时间规划，全部到位和停稳后换向。"""
 
     def __init__(self, bus, settings, parameters, rs06,
-                 clock=time.monotonic, sleep=time.sleep, sample_sink=None):
-        """复用原三轴计数/端点逻辑；第四轴保留独立恢复段与完整单程计数。"""
-        validate_topology(settings, rs06)
-        self.peer = RS06Peer(bus.rs06_io, rs06, clock, sleep,
-                            enter_preoperational=getattr(bus, 'rs06_preoperational', None))
-        bus.peer = self.peer
+                 clock=time.monotonic, sleep=time.sleep, sample_sink=None, extra_settings=()):
+        """复用三轴端点逻辑，全部伴随轴保留独立恢复段与完整单程计数。"""
+        validate_topology(settings, rs06, extra_settings)
+        configs = (rs06,) + tuple(extra_settings)
+        ios = [bus.rs06_io] + bus.extra_ios
+        if len(configs) != len(ios):
+            raise ValueError('RobStride配置数量与总线节点数量不同')
+        self.peers = []
+        for io, config in zip(ios, configs):
+            enter = (lambda io=io: bus.rs06_preoperational(io)) if hasattr(bus, 'rs06_preoperational') else None
+            self.peers.append(RS06Peer(io, config, clock, sleep, enter_preoperational=enter))
+        self.peer = self.peers[0]
+        bus.peer, bus.extra_peers = self.peer, self.peers[1:]
+        self.axis_count = 3 + len(self.peers)
         self.coordination = []
         self.last_controller = None
         super().__init__(bus, settings, parameters, clock, sleep, sample_sink,
                          controller_factory=self._controller)
 
     def _controller(self, bus, settings, clock, sleep, poll_hook):
-        """每程使用三轴共享触发控制器，并将第四轴纳入监视、到位等待和全组停止。"""
+        """每程使用Kinco共享触发控制器，全部伴随轴纳入监视、到位等待和联停。"""
         if self.last_controller is not None:
             self._record_coordination()
-        self.last_controller = FourAxisController(bus, settings, clock, sleep, poll_hook, peers=(self.peer,))
+        self.last_controller = FourAxisController(bus, settings, clock, sleep, poll_hook, peers=self.peers)
         self.last_controller.model_spread_s = self.model_spread_s
         return self.last_controller
 
     def _record_coordination(self):
         """分别保留整数模型时差和主机轮询时差；未完成程不伪造到位时间。"""
         controller = self.last_controller
-        if controller is not None and hasattr(controller, 'four_axis_observed_spread_s'):
+        if controller is not None and hasattr(controller, 'axis_observed_spread_s'):
             self.coordination.append(dict(model_arrival_spread_s=controller.model_spread_s,
-                observed_arrival_spread_s=controller.four_axis_observed_spread_s))
+                observed_arrival_spread_s=controller.axis_observed_spread_s))
             self.coordination = self.coordination[-100:]
-            LOG.info('四轴量化模型到达时差 %.6fs，轮询观察到达时差 %.6fs（含通信和确认窗口）',
-                     controller.model_spread_s, controller.four_axis_observed_spread_s)
+            LOG.info('%d轴量化模型到达时差 %.6fs，轮询观察到达时差 %.6fs（含通信和确认窗口）',
+                     self.axis_count, controller.model_spread_s, controller.axis_observed_spread_s)
         self.last_controller = None
 
     def _feedback_axes(self):
-        """按节点配置顺序输出四轴反馈，RS06 速度使用自己的 0.1 rpm 单位。"""
-        return super()._feedback_axes() + [(self.peer.io, self.peer.settings)]
+        """按配置顺序输出全部轴反馈，RobStride速度使用各手册确认的0.1rpm单位。"""
+        return super()._feedback_axes() + [(peer.io, peer.settings) for peer in self.peers]
 
-    def _leg_settings(self, endpoints, starts=None):
-        """计算共同时间并量化两种设备轮廓；原三轴继续保持同一时间规划。"""
+    def _leg_settings(self, endpoints, starts=None, companion_starts=None):
+        """按全部轴最慢轮廓规划共同秒数；inc端点不变，逐轴量化并校验时限。
+
+        companion_starts仅供完整正反程只读校验注入端点；省略则读取实际位置。
+        """
         if starts is None:
             starts = tuple(io.read(Object.ACTUAL_POSITION) for io in self.bus.axes)
         settings = super()._leg_settings(endpoints, starts)
@@ -414,52 +462,57 @@ class FourAxisReciprocationRunner(ReciprocationRunner):
         first = self.settings.axes[0]
         far = first.origin_position_inc + round(self.parameters.turns * first.settings.encoder_counts_per_rev)
         forward = endpoints[0] == far
-        target = self.peer.settings.far_position_inc if forward else self.peer.settings.origin_position_inc
-        # 同一次规划复用同一位置快照，避免静止1~2inc抖动使两次读取的
-        # 最短时间互相矛盾，误报共同时间过短。
-        rs_start = self.peer.check()['start_position_inc']
-        rs_minimum = self.peer.plan(target, start_position_inc=rs_start)
-        kinco_minimum = plan_group(settings, starts).duration_s
-        common = max(rs_minimum, kinco_minimum)
+        targets = [peer.settings.far_position_inc if forward else peer.settings.origin_position_inc
+                   for peer in self.peers]
+        # 同一次规划复用同一位置快照，避免静止抖动造成最短时间矛盾。
+        if companion_starts is None:
+            companion_starts = [peer.check()['start_position_inc'] for peer in self.peers]
+        minimums = [peer.plan(target, start_position_inc=start)
+                    for peer, target, start in zip(self.peers, targets, companion_starts)]
+        common = max([plan_group(settings, starts).duration_s] + minimums)
         if common:
             common += ABSOLUTE_POSITION_TIME_MARGIN_S
         settings = replace(settings, duration_s=common if common else None)
         plan = plan_group(settings, starts)
-        rs_duration = self.peer.plan(target, common, start_position_inc=rs_start)
+        durations = [peer.plan(target, common, start_position_inc=start)
+                     for peer, target, start in zip(self.peers, targets, companion_starts)]
         moving = [axis.estimated_duration_s for axis, start in zip(plan.axes, starts) if axis.end_inc != start]
-        if rs_duration:
-            moving.append(rs_duration)
+        moving.extend(duration for duration in durations if duration)
         self.model_spread_s = max(moving) - min(moving) if moving else 0
-        LOG.info('四轴共同规划 %.6fs，RS06 %.3f RPM，量化模型到达时差 %.6fs',
-                 common, self.peer.velocity_raw / 10, self.model_spread_s)
+        LOG.info('%d轴共同规划 %.6fs，RobStride轮廓RPM=%s，量化模型到达时差 %.6fs',
+                 self.axis_count, common, [peer.velocity_raw / 10 for peer in self.peers], self.model_spread_s)
         return settings
 
     def check(self):
-        """只读检查四轴端点、首程恢复及完整正反两程，均在第一次使能前完成。"""
+        """只读校验全部端点及完整正反程，恢复段不能掩盖完整行程超时。"""
         checked = super().check()
-        rs_checked = self.peer.check()
-        # 从中途恢复的短距离可行，不代表完整100圈也能在配置超时内完成。
-        distance = (self.peer.settings.far_position_inc - self.peer.settings.origin_position_inc) / RS06_COUNTS_PER_REV
-        velocity = self.peer.settings.velocity_raw(self.peer.settings.velocity_rpm) / 600
-        acceleration = self.peer.settings.acceleration_raw(self.peer.settings.velocity_rpm / 60 /
-                                                          self.peer.settings.acceleration_time_s) / 600
-        rs_full, _ = profile_time(distance, velocity, acceleration, acceleration)
-        if rs_full >= self.peer.settings.motion_timeout_s:
-            raise ValueError('RS06 完整往返单程超过运动超时')
-        for endpoints, starts in ((checked['far_positions_inc'], checked['origin_positions_inc']),
-                                  (checked['origin_positions_inc'], checked['far_positions_inc'])):
-            full_leg = super()._leg_settings(endpoints, starts)
-            common = max(rs_full, plan_group(full_leg, starts).duration_s)
-            plan_group(replace(full_leg, duration_s=common), starts)
-            if common >= self.peer.settings.motion_timeout_s:
-                raise ValueError('四轴完整单程共同时间超过 RS06 运动超时')
-        checked['rs06'] = rs_checked
+        companion_checks = [peer.check() for peer in self.peers]
+        for forward in (True, False):
+            endpoints = checked['far_positions_inc'] if forward else checked['origin_positions_inc']
+            starts = checked['origin_positions_inc'] if forward else checked['far_positions_inc']
+            companion_starts = [peer.settings.origin_position_inc if forward else peer.settings.far_position_inc
+                                for peer in self.peers]
+            try:
+                self._leg_settings(endpoints, starts, companion_starts)
+            except ValueError as exc:
+                raise ValueError(f'全部轴完整单程校验失败：{exc}') from exc
+        forward = checked['effective_start_direction'] == 'forward'
+        # 全组完整单程要求每个轴均从相反固定端点出发；各伴随轴仍另行独立计数。
+        checked['partial_first_leg'] = checked['partial_first_leg'] or any(
+            abs(row['start_position_inc'] - (peer.settings.origin_position_inc if forward
+                else peer.settings.far_position_inc)) > peer.settings.position_tolerance_inc
+            for peer, row in zip(self.peers, companion_checks))
+        checked['axis_count'] = self.axis_count
+        checked['rs06'] = companion_checks[0]
+        checked['robstride_axes'] = [dict(row, model=getattr(peer.settings, 'model', 'RS06'))
+                                     for peer, row in zip(self.peers, companion_checks)]
         self._leg_settings(checked['first_target_positions_inc'], checked['start_positions_inc'])
-        self.peer.preflight()
+        for peer in self.peers:
+            peer.preflight()
         return checked
 
     def run(self):
-        """运行四轴并追加第四轴计数；异常时控制器先请求全部停止再逐轴确认。"""
+        """运行混合多轴并追加各伴随轴计数；异常时先请求全部停止再逐轴确认。"""
         try:
             return super().run()
         finally:
@@ -467,8 +520,16 @@ class FourAxisReciprocationRunner(ReciprocationRunner):
             self.report['rs06_completed_legs'] = self.peer.completed_legs
             self.report['rs06_completed_full_legs'] = self.peer.completed_full_legs
             self.report['rs06_completed_round_trips'] = self.peer.completed_full_legs // 2
-            self.report['four_axis_model_arrival_spread_s'] = getattr(self, 'model_spread_s', None)
-            self.report['four_axis_recent_coordination'] = self.coordination
+            if self.axis_count == 4:
+                self.report['four_axis_model_arrival_spread_s'] = getattr(self, 'model_spread_s', None)
+                self.report['four_axis_recent_coordination'] = self.coordination
+            self.report['axis_count'] = self.axis_count
+            self.report['axis_model_arrival_spread_s'] = getattr(self, 'model_spread_s', None)
+            self.report['axis_recent_coordination'] = self.coordination
+            self.report['robstride_counts'] = [dict(node_id=peer.settings.node_id,
+                model=getattr(peer.settings, 'model', 'RS06'), completed_legs=peer.completed_legs,
+                completed_full_legs=peer.completed_full_legs,
+                completed_round_trips=peer.completed_full_legs // 2) for peer in self.peers]
             self.report['hardware_validated'] = False
 
 

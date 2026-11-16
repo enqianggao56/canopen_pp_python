@@ -1,6 +1,6 @@
 # Kinco CANopen PP Python
 
-使用 Python，通过 CANopen SDO/RPDO 控制 Kinco 伺服电机运行于 PP（Profile Position，轮廓位置）模式。支持单轴、三轴，以及三台 Kinco 加一台 RobStride RS06 的四轴往返，包含中文注释、命令行示例、模拟器及虚拟 CAN 协议测试。四轴实机接入与验证范围见[记录](docs/hardware-validation.md)。
+使用 Python，通过 CANopen SDO/RPDO 控制 Kinco 伺服电机运行于 PP（Profile Position，轮廓位置）模式。支持单轴、三轴、三台Kinco加RS06的四轴往返，以及新增RS00和两台EL05的七轴往返，包含中文注释、命令行示例、模拟器及虚拟 CAN 协议测试。四轴实机接入与验证范围见[记录](docs/hardware-validation.md)。
 
 当前接入目标为 **iSMD60D-040-DQBK-AA000 + CANable，1 Mbit/s**。已完成软件测试、节点 1 的实机正向 600 圈定位、节点 1/2/3 的三轴小位移定位，以及三轴各 150 圈、速度指令 600 RPM 的实机运行，详见[实机验证记录](docs/hardware-validation.md)。配置和机械运动范围须结合每次实机状态确认。
 
@@ -217,6 +217,30 @@ RS06模板起点0仅供模拟；固定两端相差1638400 inc才是100圈。默�
 
 此前使用RS06 SDO反馈的版本已实测一次完整四轴往返：三轴各反向600圈再正向600圈，RS06反向100圈再正向100圈，约136.207秒，正常停止。巡航反馈均值约三轴598～601 RPM、RS06 99.2 RPM；四轴到位确认的主机观察时差约0.368/0.399秒，包含RS06稳定确认窗口，不能视为机械同步精度。结束后独立只读检查确认停稳，PDO/SYNC与本次启动前基线一致，详情见[完整往返记录](docs/hardware-validation.md#四轴固定绝对端点完整往返实机验证)。
 
+## 七轴：新增RS00和两台EL05
+
+独立七轴入口支持节点1/2/3 Kinco、4 RS06、5 RS00、6/7 EL05。新增三轴与RS06均为
+每程100圈、100 RPM，加减速各2秒；前三轴仍为600圈、600 RPM。四台RobStride共用
+用户确认的`RS06.eds`，单位和PP流程已分别对照新增手册。各轴端点、限位、力矩及验证标志独立配置。
+
+```bash
+# 纯模拟，一次完整往返；不连接真实电机：
+python -m kinco_pp.seven_axis_reciprocate --legs 2
+# 使用现场配置只读检查：
+python -m kinco_pp.seven_axis_reciprocate \
+  --config config/local.seven_axis.kinco.json \
+  --robstride-config config/local.seven_axis.robstride.json --check
+```
+
+配置模板为`config/seven_axis.kinco.example.json`和`config/seven_axis.robstride.example.json`。
+已有节点1～4必须复用原已确认端点；新增节点5～7的模板起点0只供模拟，须逐轴填写真实确认坐标。
+全部目标RPDO装载后以同一条SYNC释放，运动反馈统一走TPDO；任一轴异常则请求全部已使能轴停止，
+全组停稳后恢复临时配置。程序会等待最后一台轴到位，再共同换向。
+
+RS00/EL05的速度、位移单位与RS06相同，力矩换算不同：6071原始100分别约0.5/0.2 N·m，
+不能照搬RS06的1.1 N·m说明。七轴软件和虚拟CAN可验证控制流程，**尚未完成七轴实机验证**。
+配置复制、实机命令、各轴COB-ID和验证要求见[七轴使用说明](docs/seven-axis.md)。
+
 ## 测试与开发
 
 ```bash
@@ -227,6 +251,9 @@ python -m compileall -q src examples tests
 测试使用标准库 `unittest`，覆盖换算、状态切换、PP 应答、重复相对运动、负坐标、旧到位位、超时、故障和中断清理。三轴测试额外验证时间规划、单帧触发、节点重复/掉线、共享 COB-ID 冲突、部分映射失败回滚及全组暂停。协议测试采用 `canopen.LocalNode` 与 `python-can` 的 `virtual` 后端，不访问 CANable。模拟结果不等同于真实电机验证。
 
 四轴测试额外覆盖RS06独立单位及无bit12流程、共同SYNC、等待第四轴后换向、任一厂家的异常联停、映射拒绝回滚、端点恢复及四轴反馈。虚拟CAN从站使用两份真实EDS，缓存同步RPDO至同一SYNC再执行，并按实际TPDO映射组帧。测试禁止全部四轴运动反馈SDO访问，覆盖RS06状态/速度缺帧联停、负值解码、独立缓存过期、反馈COB-ID冲突及TPDO配置失败恢复。
+
+七轴测试额外覆盖RS00/EL05单位、独立端点与恢复段计数、最后轴到位屏障、七节点共同SYNC、
+全组TPDO反馈及新增轴失败时的联停/配置恢复。
 
 模块和函数提供中文说明，关键步骤标明索引、位定义及单位。保留单轴命令与 API；三轴使用 `ThreeAxisController`、`GroupSettings` 和 `CanopenGroupBus`。同一节点不得由多个控制器并发操作。
 

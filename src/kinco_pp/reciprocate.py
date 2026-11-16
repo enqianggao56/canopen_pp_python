@@ -255,9 +255,11 @@ def main(argv=None):
     出错返回 1，Ctrl+C 正常停止返回 130，限时或指定程数完成返回 0。
     --output 保存 JSON 摘要，--csv 流式记录完整反馈，均由用户显式指定路径。
     """
-    parser = argparse.ArgumentParser(description='三轴或三台Kinco加RS06四轴 PP 往返；默认模拟，Ctrl+C 停止')
+    parser = argparse.ArgumentParser(description='三轴、四轴或七轴 PP 往返；默认模拟，Ctrl+C 停止')
     parser.add_argument('--config', default='config/reciprocate.example.json')
-    parser.add_argument('--rs06-config', help='附加 RS06 独立配置，启用四轴共同 SYNC 往返')
+    companions = parser.add_mutually_exclusive_group()
+    companions.add_argument('--rs06-config', help='附加RS06独立配置，启用四轴共同SYNC往返')
+    companions.add_argument('--robstride-config', help='四台RobStride独立端点配置，启用七轴共同SYNC往返')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--execute', action='store_true', help='执行已核对配置的实机运动')
     mode.add_argument('--check', action='store_true', help='只连接实机读取并校验往返端点，不触发运动')
@@ -280,24 +282,35 @@ def main(argv=None):
         parameters = RunParameters(args.turns, args.velocity, args.accel_time, args.decel_time,
                                    args.duration, args.legs, args.sample_interval, args.start_direction)
         settings = GroupSettings.load(args.config)
-        rs06 = None
-        if args.rs06_config:
+        rs06, profiles = None, ()
+        if args.rs06_config or args.robstride_config:
             from .rs06 import RS06Settings
             from .four_axis_reciprocate import (FourAxisBus, FourAxisReciprocationRunner,
                                                 SimulatedFourAxisBus, validate_topology)
-            rs06 = RS06Settings.load(args.rs06_config)
-            validate_topology(settings, rs06)
+            if args.robstride_config:
+                from .robstride import load_seven_axis_profiles
+                from .seven_axis_reciprocate import (SevenAxisBus, SevenAxisReciprocationRunner,
+                                                     SimulatedSevenAxisBus)
+                profiles = load_seven_axis_profiles(args.robstride_config)
+                rs06 = profiles[0]
+            else:
+                rs06 = RS06Settings.load(args.rs06_config)
+                profiles = (rs06,)
+            validate_topology(settings, rs06, profiles[1:])
             if not args.execute and not args.check:
                 # 模拟器坐标由本地初始化确定，仅在纯模拟时建立绝对坐标确认。
                 # 实机执行和只读检查均保留用户配置的确认标志。
                 settings = replace(settings, axes=tuple(replace(axis,
                     settings=replace(axis.settings, absolute_reference_verified=True))
                     for axis in settings.axes))
-            if args.execute and not (rs06.hardware_verified and rs06.absolute_reference_verified
-                                     and rs06.synchronous_pdo_verified):
-                raise ValueError('RS06 实机运行前须核对 hardware_verified、absolute_reference_verified、synchronous_pdo_verified')
+            if args.execute:
+                for profile in profiles:
+                    if not (profile.hardware_verified and profile.absolute_reference_verified
+                            and profile.synchronous_pdo_verified):
+                        raise ValueError(f"{getattr(profile, 'model', 'RS06')}/节点{profile.node_id} 实机运行前须核对 "
+                                         'hardware_verified、absolute_reference_verified、synchronous_pdo_verified')
             if args.execute and not all(axis.settings.absolute_reference_verified for axis in settings.axes):
-                raise ValueError('四轴固定绝对端点运行前须逐轴确认Kinco absolute_reference_verified')
+                raise ValueError('混合多轴固定绝对端点运行前须逐轴确认Kinco absolute_reference_verified')
         if args.execute and (not settings.pdo_configuration_verified
                 or not all(a.settings.hardware_verified for a in settings.axes)):
             raise ValueError('实机运行前必须核对所有 hardware_verified 和 pdo_configuration_verified')
@@ -306,8 +319,7 @@ def main(argv=None):
             csv_file = Path(args.csv).open('x', newline='', encoding='utf-8')
             writer = csv.writer(csv_file)
             nodes = [a.settings.node_id for a in settings.axes]
-            if rs06 is not None:
-                nodes.append(rs06.node_id)
+            nodes.extend(profile.node_id for profile in profiles)
             writer.writerow(['elapsed_s', 'phase']
                             + [f'node{node}_rpm' for node in nodes]
                             + [f'node{node}_inc' for node in nodes]
@@ -319,22 +331,34 @@ def main(argv=None):
                                 + row['positions_inc'] + row['statuswords'])
                 csv_file.flush()
         if args.execute or args.check:
-            bus = CanopenGroupBus(settings) if rs06 is None else FourAxisBus(settings, rs06)
+            if args.robstride_config:
+                bus = SevenAxisBus(settings, profiles)
+            else:
+                bus = CanopenGroupBus(settings) if rs06 is None else FourAxisBus(settings, rs06)
             bus.open()
             LOG.info('全部轴身份：%s', bus.verify_identities())
             if rs06 is not None:
                 bus.check_sync_configuration()
         else:
             LOG.info('模拟往返，不连接CAN或真实电机；模拟器不模拟机械运动时间')
-            bus = SimulatedGroupBus() if rs06 is None else SimulatedFourAxisBus()
-        runner = (ReciprocationRunner(bus, settings, parameters, sample_sink=sink) if rs06 is None
-                  else FourAxisReciprocationRunner(bus, settings, parameters, rs06, sample_sink=sink))
+            if args.robstride_config:
+                bus = SimulatedSevenAxisBus(tuple(axis.origin_position_inc for axis in settings.axes),
+                                             tuple(profile.origin_position_inc for profile in profiles))
+            else:
+                bus = SimulatedGroupBus() if rs06 is None else SimulatedFourAxisBus()
+        if args.robstride_config:
+            runner = SevenAxisReciprocationRunner(bus, settings, parameters, profiles, sample_sink=sink)
+        else:
+            runner = (ReciprocationRunner(bus, settings, parameters, sample_sink=sink) if rs06 is None
+                      else FourAxisReciprocationRunner(bus, settings, parameters, rs06, sample_sink=sink))
         if args.check:
             checked = runner.check()
             runner.report.update(checked, check_only=True, success=True, stop_reason='check')
             LOG.info('只读端点校验通过：当前位置=%s，固定起点=%s，远端=%s，首次方向=%s，首程为恢复段=%s',
                      checked['start_positions_inc'], checked['origin_positions_inc'],
                      checked['far_positions_inc'], checked['effective_start_direction'], checked['partial_first_leg'])
+            if profiles:
+                LOG.info('RobStride逐轴端点：%s', checked['robstride_axes'])
             LOG.info('未发送NMT启动、PDO配置、使能或运动指令')
             code = 0
         else:

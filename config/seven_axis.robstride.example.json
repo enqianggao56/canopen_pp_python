@@ -1,0 +1,77 @@
+{
+  "defaults": {
+    "eds": "../RS06.eds",
+    "interface": "socketcan",
+    "channel": "can0",
+    "bitrate": 1000000,
+    "expected_vendor_id": 1366,
+    "expected_product_code": 17988,
+    "velocity_rpm": 100,
+    "acceleration_time_s": 2,
+    "torque_limit_raw": 100,
+    "position_tolerance_inc": 25,
+    "position_window_time_ms": 100,
+    "zero_velocity_tolerance_rpm": 0,
+    "standstill_duration_s": 0.1,
+    "sdo_timeout_s": 0.3,
+    "sdo_pause_s": 0.005,
+    "state_timeout_s": 3,
+    "motion_timeout_s": 90,
+    "poll_interval_s": 0.02,
+    "watchdog_timeout_s": 1,
+    "sync_settle_s": 0.003,
+    "hardware_verified": false,
+    "absolute_reference_verified": false,
+    "synchronous_pdo_verified": false
+  },
+  "axes": [
+    {
+      "model": "RS06",
+      "node_id": 4,
+      "origin_position_inc": 0,
+      "far_position_inc": 1638400,
+      "min_position_inc": -25,
+      "max_position_inc": 1638425,
+      "target_cob_id": 1284,
+      "hardware_verified": false,
+      "absolute_reference_verified": false,
+      "synchronous_pdo_verified": false
+    },
+    {
+      "model": "RS00",
+      "node_id": 5,
+      "origin_position_inc": 0,
+      "far_position_inc": 1638400,
+      "min_position_inc": -25,
+      "max_position_inc": 1638425,
+      "target_cob_id": 1285,
+      "hardware_verified": false,
+      "absolute_reference_verified": false,
+      "synchronous_pdo_verified": false
+    },
+    {
+      "model": "EL05",
+      "node_id": 6,
+      "origin_position_inc": 0,
+      "far_position_inc": 1638400,
+      "min_position_inc": -25,
+      "max_position_inc": 1638425,
+      "target_cob_id": 1286,
+      "hardware_verified": false,
+      "absolute_reference_verified": false,
+      "synchronous_pdo_verified": false
+    },
+    {
+      "model": "EL05",
+      "node_id": 7,
+      "origin_position_inc": 0,
+      "far_position_inc": 1638400,
+      "min_position_inc": -25,
+      "max_position_inc": 1638425,
+      "target_cob_id": 1287,
+      "hardware_verified": false,
+      "absolute_reference_verified": false,
+      "synchronous_pdo_verified": false
+    }
+  ]
+}
