@@ -34,7 +34,8 @@
         "acceleration_rps2": 5,
         "deceleration_rps2": 5,
         "relative": true
-      }
+      },
+      "origin_position_inc": 0
     },
     {
       "name": "y",
@@ -45,7 +46,8 @@
         "acceleration_rps2": 5,
         "deceleration_rps2": 5,
         "relative": true
-      }
+      },
+      "origin_position_inc": 0
     },
     {
       "name": "z",
@@ -56,7 +58,8 @@
         "acceleration_rps2": 5,
         "deceleration_rps2": 5,
         "relative": true
-      }
+      },
+      "origin_position_inc": 0
     }
   ]
 }

@@ -38,6 +38,7 @@ class RunParameters:
     duration_s: Optional[float] = None
     legs: Optional[int] = None
     sample_interval_s: float = 0.25
+    start_direction: str = 'forward'
 
     def __post_init__(self):
         """校验有限正参数；无效值抛 ValueError，拒绝零时间和无意义的采样周期。"""
@@ -48,6 +49,8 @@ class RunParameters:
             positive(self.duration_s, 'duration_s')
         if self.legs is not None:
             integer(self.legs, 1, (1 << 31) - 1, 'legs')
+        if self.start_direction not in ('forward', 'reverse'):
+            raise ValueError('start_direction 必须是 forward 或 reverse')
 
     @property
     def acceleration_rps2(self):
@@ -78,7 +81,8 @@ class ReciprocationRunner:
         self.phase = 'idle'
         self.samples = deque(maxlen=4096)
         self.report = dict(parameters=asdict(parameters), completed_legs=0,
-                           completed_round_trips=0, sample_count=0, recent_legs=[],
+                           completed_full_legs=0, completed_round_trips=0,
+                           sample_count=0, recent_legs=[],
                            stop_reason=None, success=False)
 
     def _check_duration(self):
@@ -111,17 +115,63 @@ class ReciprocationRunner:
                      ', '.join(f'{v:+.2f}' for v in velocities), positions)
             self.next_log = elapsed + 5
 
-    def _leg_settings(self, endpoints):
+    def _leg_settings(self, endpoints, starts=None):
         """以固定端点和当前反馈计算相对指令，不自动扩大用户配置的软件运动范围。"""
         axes = []
-        for config, io, target in zip(self.settings.axes, self.bus.axes, endpoints):
-            current = io.read(Object.ACTUAL_POSITION)
+        if starts is None:
+            starts = tuple(io.read(Object.ACTUAL_POSITION) for io in self.bus.axes)
+        for config, current, target in zip(self.settings.axes, starts, endpoints):
             motion = Motion(target - current, self.parameters.velocity_rpm,
                             self.parameters.acceleration_rps2,
                             self.parameters.deceleration_rps2, relative=True)
             motion.validate(config.settings, current)
             axes.append(replace(config, motion=motion))
         return replace(self.settings, axes=tuple(axes), duration_s=None)
+
+    def check(self):
+        """只读校验当前位置、固定起点、两端及轮廓，返回计划；不使能、不写 PDO。
+
+        配置 origin_position_inc 时重启复用原端点；全部省略时兼容旧版的
+        本次启动点锚定方式。首次从区间中途恢复只算恢复段，不冒充600圈完整单程。
+        若已在所选方向的端点，则从相反方向开始，避免零位移空计数。
+        """
+        starts = tuple(io.read(Object.ACTUAL_POSITION) for io in self.bus.axes)
+        fixed = all(axis.origin_position_inc is not None for axis in self.settings.axes)
+        origin = tuple(axis.origin_position_inc if fixed else start
+                       for axis, start in zip(self.settings.axes, starts))
+        distant = []
+        for config, start in zip(self.settings.axes, origin):
+            raw_distance = self.parameters.turns * config.settings.encoder_counts_per_rev
+            distance = round(raw_distance)
+            if distance <= 0 or abs(raw_distance - distance) > 1e-6:
+                raise ValueError('圈数必须能表示为各轴整数 inc')
+            distant.append(start + distance)
+        plans = []
+        for endpoints in (distant, origin):
+            try:
+                leg = self._leg_settings(endpoints, starts)
+                # 相对指令以实际当前位置为基准，不能错误地再叠加到固定起点。
+                plans.append(plan_group(leg, starts))
+            except ValueError as exc:
+                details = '; '.join(
+                    f'{a.name}/节点{a.settings.node_id}: 当前={current}, 起点={low}, '
+                    f'远端={high}, 范围=[{a.settings.min_position_inc},{a.settings.max_position_inc}]'
+                    for a, current, low, high in zip(self.settings.axes, starts, origin, distant))
+                raise ValueError(f'往返范围/参数校验失败：{exc}；{details}。未发送运动指令') from exc
+        forward = self.parameters.start_direction == 'forward'
+        selected = distant if forward else origin
+        if all(abs(current - target) <= axis.settings.position_tolerance_inc
+               for axis, current, target in zip(self.settings.axes, starts, selected)):
+            forward = not forward
+        initial_endpoint = origin if forward else distant
+        partial = any(abs(current - target) > axis.settings.position_tolerance_inc
+                      for axis, current, target in zip(self.settings.axes, starts, initial_endpoint))
+        return dict(start_positions_inc=starts, origin_positions_inc=origin,
+                    far_positions_inc=distant, fixed_origins=fixed,
+                    effective_start_direction='forward' if forward else 'reverse',
+                    partial_first_leg=partial,
+                    first_target_positions_inc=distant if forward else origin,
+                    first_leg_estimated_s=plans[0 if forward else 1].duration_s)
 
     def run(self):
         """运行至限时/程数或中断，返回报告；通信/故障/停机失败仍抛异常。
@@ -131,24 +181,16 @@ class ReciprocationRunner:
         内存仅保留最近 4096 个样本和 100 程摘要，完整采样可经 sink 写 CSV。
         """
         try:
-            origin = tuple(axis.read(Object.ACTUAL_POSITION) for axis in self.bus.axes)
-            distant = []
-            for config, start in zip(self.settings.axes, origin):
-                raw_distance = self.parameters.turns * config.settings.encoder_counts_per_rev
-                distance = round(raw_distance)
-                if distance <= 0 or abs(raw_distance - distance) > 1e-6:
-                    raise ValueError('圈数必须能表示为各轴整数 inc')
-                distant.append(start + distance)
-            self.report.update(origin_positions_inc=origin, far_positions_inc=distant)
-            # 正反两端在任何轴使能前都校验，避免去程可行而回程越界。
-            for endpoints in (distant, origin):
-                leg = self._leg_settings(endpoints)
-                plan_group(leg, origin)
+            checked = self.check()
+            self.report.update(checked)
+            origin, distant = checked['origin_positions_inc'], checked['far_positions_inc']
+            first_forward = checked['effective_start_direction'] == 'forward'
             self.started_at = self.clock()
-            self.phase = 'forward'
+            self.phase = checked['effective_start_direction']
             while True:
                 self._check_duration()
-                forward = self.report['completed_legs'] % 2 == 0
+                even_leg = self.report['completed_legs'] % 2 == 0
+                forward = first_forward if even_leg else not first_forward
                 self.phase = 'forward' if forward else 'reverse'
                 endpoints = distant if forward else origin
                 leg = self._leg_settings(endpoints)
@@ -160,9 +202,13 @@ class ReciprocationRunner:
                          self.parameters.deceleration_time_s)
                 result = controller.run()
                 count = self.report['completed_legs'] + 1
-                self.report.update(completed_legs=count, completed_round_trips=count // 2)
+                full_stroke = not (count == 1 and checked['partial_first_leg'])
+                full_count = self.report['completed_full_legs'] + int(full_stroke)
+                self.report.update(completed_legs=count, completed_full_legs=full_count,
+                                   completed_round_trips=full_count // 2)
                 self.report['recent_legs'].append(dict(number=count, phase=self.phase,
-                    positions_inc=result.positions, observed_arrival_spread_s=result.observed_arrival_spread_s))
+                    full_stroke=full_stroke, positions_inc=result.positions,
+                    observed_arrival_spread_s=result.observed_arrival_spread_s))
                 self.report['recent_legs'] = self.report['recent_legs'][-100:]
                 if self.parameters.legs is not None and count >= self.parameters.legs:
                     self.report['stop_reason'] = 'leg_limit'
@@ -199,19 +245,24 @@ class ReciprocationRunner:
 def main(argv=None):
     """命令行入口；默认模拟且无限往返，--execute 才驱动实机，--duration 限时。
 
+    --check只读校验端点；--start-direction reverse先继续回到原起点。
     出错返回 1，Ctrl+C 正常停止返回 130，限时或指定程数完成返回 0。
     --output 保存 JSON 摘要，--csv 流式记录完整反馈，均由用户显式指定路径。
     """
     parser = argparse.ArgumentParser(description='三轴 PP 正反往返测试；默认模拟，Ctrl+C 暂停')
     parser.add_argument('--config', default='config/reciprocate.example.json')
-    parser.add_argument('--execute', action='store_true', help='执行已核对配置的实机运动')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--execute', action='store_true', help='执行已核对配置的实机运动')
+    mode.add_argument('--check', action='store_true', help='只连接实机读取并校验往返端点，不触发运动')
     parser.add_argument('--turns', type=float, default=600, help='单程圈数，默认600')
     parser.add_argument('--velocity', type=float, default=600, help='轮廓速度rpm，默认600')
     parser.add_argument('--accel-time', type=float, default=2, help='0到设定速度的加速秒数')
     parser.add_argument('--decel-time', type=float, default=2, help='设定速度到0的减速秒数')
     parser.add_argument('--duration', type=float, help='观察秒数，到时减速暂停；省略则不限时')
-    parser.add_argument('--legs', type=int, help='最多单程数；2程为一次完整往返')
+    parser.add_argument('--legs', type=int, help='最多到位段数（含恢复段）；无恢复段时2段为完整往返')
     parser.add_argument('--sample-interval', type=float, default=0.25, help='同线程采样间隔秒数')
+    parser.add_argument('--start-direction', choices=('forward', 'reverse'), default='forward',
+                        help='重启后首先前往正向远端或原起点，默认forward')
     parser.add_argument('--output', help='JSON结果文件路径')
     parser.add_argument('--csv', help='完整反馈CSV文件路径')
     args = parser.parse_args(argv)
@@ -220,7 +271,7 @@ def main(argv=None):
     code = 1
     try:
         parameters = RunParameters(args.turns, args.velocity, args.accel_time, args.decel_time,
-                                   args.duration, args.legs, args.sample_interval)
+                                   args.duration, args.legs, args.sample_interval, args.start_direction)
         settings = GroupSettings.load(args.config)
         if args.execute and (not settings.pdo_configuration_verified
                 or not all(a.settings.hardware_verified for a in settings.axes)):
@@ -240,7 +291,7 @@ def main(argv=None):
                 writer.writerow([row['elapsed_s'], row['phase']] + row['velocities_rpm']
                                 + row['positions_inc'] + row['statuswords'])
                 csv_file.flush()
-        if args.execute:
+        if args.execute or args.check:
             bus = CanopenGroupBus(settings)
             bus.open()
             LOG.info('三轴身份：%s', bus.verify_identities())
@@ -248,11 +299,20 @@ def main(argv=None):
             LOG.info('模拟往返，不连接CAN或真实电机；模拟器不模拟机械运动时间')
             bus = SimulatedGroupBus()
         runner = ReciprocationRunner(bus, settings, parameters, sample_sink=sink)
-        report = runner.run()
-        LOG.info('结束：原因=%s，完成单程=%d，完整往返=%d，经过=%.3fs，最后方向=%s',
-                 report['stop_reason'], report['completed_legs'], report['completed_round_trips'],
-                 report['elapsed_s'], report['last_phase'])
-        code = 130 if report['stop_reason'] == 'interrupt' else 0
+        if args.check:
+            checked = runner.check()
+            runner.report.update(checked, check_only=True, success=True, stop_reason='check')
+            LOG.info('只读端点校验通过：当前位置=%s，固定起点=%s，远端=%s，首次方向=%s，首程为恢复段=%s',
+                     checked['start_positions_inc'], checked['origin_positions_inc'],
+                     checked['far_positions_inc'], checked['effective_start_direction'], checked['partial_first_leg'])
+            LOG.info('未发送NMT启动、PDO配置、使能或运动指令')
+            code = 0
+        else:
+            report = runner.run()
+            LOG.info('结束：原因=%s，到位段=%d，完整单程=%d，完整往返=%d，经过=%.3fs，最后方向=%s',
+                     report['stop_reason'], report['completed_legs'], report['completed_full_legs'],
+                     report['completed_round_trips'], report['elapsed_s'], report['last_phase'])
+            code = 130 if report['stop_reason'] == 'interrupt' else 0
     except Exception as exc:
         LOG.error('往返测试失败：%s', exc)
     finally:
@@ -266,7 +326,7 @@ def main(argv=None):
             except Exception as exc:
                 LOG.error('保存报告失败：%s', exc)
                 code = 1
-        if args.execute and bus is not None:
+        if (args.execute or args.check) and bus is not None:
             try:
                 bus.close()
             except Exception as exc:

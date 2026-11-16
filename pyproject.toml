@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kinco-canopen-pp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Kinco servo CANopen Profile Position controller"
 readme = "README.md"
 requires-python = ">=3.8"

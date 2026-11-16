@@ -1,6 +1,7 @@
 """往返程序回归：同步方向切换、固定端点、限时/中断联停及参数校验。"""
 
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from kinco_pp.group_controller import GroupError
@@ -48,6 +49,89 @@ class ReciprocationTests(unittest.TestCase):
         self.assertEqual(params.acceleration_rps2, 5)
         self.assertEqual(params.deceleration_rps2, 5)
         self.assertEqual(self.settings.axes[0].settings.acceleration_raw(5), 5368)
+
+    def test_restart_in_middle_reuses_fixed_endpoints_without_expanding_limits(self):
+        """复现途中停止后重启：仍使用原600圈端点，不再从当前点外移600圈。"""
+        origins = (9831460, 18658770, 25649714)
+        self.settings = replace(self.settings, axes=tuple(
+            replace(axis, origin_position_inc=origin, settings=replace(axis.settings,
+                min_position_inc=origin-10, max_position_inc=origin+39321600+10))
+            for axis, origin in zip(self.settings.axes, origins)))
+        limits = [(a.settings.min_position_inc, a.settings.max_position_inc) for a in self.settings.axes]
+        self.bus = SimulatedGroupBus(tuple(origin+7238575 for origin in origins))
+        checked = self.runner().check()
+        self.assertEqual(checked['origin_positions_inc'], origins)
+        self.assertEqual(checked['far_positions_inc'], [origin+39321600 for origin in origins])
+        self.assertTrue(checked['partial_first_leg'])
+        self.assertTrue(all(not io.writes for io in self.bus.axes))
+        self.assertEqual(limits, [(a.settings.min_position_inc, a.settings.max_position_inc)
+                                 for a in self.settings.axes])
+
+    def test_recovery_segment_is_not_counted_as_full_stroke(self):
+        """中途恢复段到位后，再完成两程才应累计一次完整600圈往返。"""
+        self.bus = SimulatedGroupBus((10000, 20000, 30000))
+        report = self.runner(RunParameters(legs=3)).run()
+        self.assertEqual(report['completed_legs'], 3)
+        self.assertEqual(report['completed_full_legs'], 2)
+        self.assertEqual(report['completed_round_trips'], 1)
+        self.assertEqual([leg['full_stroke'] for leg in report['recent_legs']], [False, True, True])
+        self.assertEqual(report['recent_legs'][0]['positions_inc'], (39321600,)*3)
+
+    def test_restart_reverse_resumes_toward_original_origin(self):
+        """指定reverse时先完成回原起点的剩余距离，不能把恢复段冒充600圈。"""
+        self.bus = SimulatedGroupBus((10000, 20000, 30000))
+        report = self.runner(RunParameters(legs=1, start_direction='reverse')).run()
+        self.assertEqual(report['effective_start_direction'], 'reverse')
+        self.assertEqual(report['recent_legs'][0]['positions_inc'], (0, 0, 0))
+        self.assertEqual(report['completed_full_legs'], 0)
+        self.assertEqual(report['completed_round_trips'], 0)
+
+    def test_start_at_far_endpoint_reverses_without_zero_distance_leg(self):
+        """已经在正向端点时直接反向，不将零位移计成一程。"""
+        self.bus = SimulatedGroupBus((39321600,)*3)
+        report = self.runner(RunParameters(legs=1)).run()
+        self.assertEqual(report['effective_start_direction'], 'reverse')
+        self.assertFalse(report['partial_first_leg'])
+        self.assertEqual(report['completed_full_legs'], 1)
+        self.assertEqual(report['recent_legs'][0]['positions_inc'], (0, 0, 0))
+
+    def test_coordinate_reset_or_turn_count_mismatch_does_not_bypass_limits(self):
+        """坐标已不在原范围或请求更长行程时，仍在任何使能前拒绝。"""
+        self.bus = SimulatedGroupBus((-200,)*3)
+        with self.assertRaisesRegex(ValueError, '未发送运动指令'):
+            self.runner().check()
+        self.assertTrue(all(not io.writes for io in self.bus.axes))
+        self.bus = SimulatedGroupBus()
+        with self.assertRaises(ValueError):
+            self.runner(RunParameters(turns=601)).check()
+        self.assertEqual(self.bus.frames, [])
+
+    def test_partial_origin_configuration_rejected(self):
+        """不能只固定部分轴而让另外轴随重启漂移。"""
+        axes = self.settings.axes
+        with self.assertRaises(ValueError):
+            replace(self.settings, axes=(replace(axes[0], origin_position_inc=None),)+axes[1:])
+
+    def test_legacy_config_can_still_anchor_current_position(self):
+        """未配置固定起点时保留旧接口，但必须满足已有软件范围。"""
+        self.settings = replace(self.settings, axes=tuple(
+            replace(axis, origin_position_inc=None) for axis in self.settings.axes))
+        self.bus = SimulatedGroupBus((10,)*3)
+        checked = self.runner().check()
+        self.assertFalse(checked['fixed_origins'])
+        self.assertEqual(checked['origin_positions_inc'], (10, 10, 10))
+
+    def test_check_cli_only_reads_and_never_configures_or_enables(self):
+        """--check使用实机接口进行只读校验，不受execute核对标志影响且不运动。"""
+        with patch('kinco_pp.reciprocate.CanopenGroupBus') as factory:
+            bus = factory.return_value
+            bus.axes = self.bus.axes
+            self.assertEqual(main(['--check']), 0)
+            bus.configure.assert_not_called()
+            bus.start_all.assert_not_called()
+            bus.broadcast.assert_not_called()
+            bus.close.assert_called_once()
+        self.assertTrue(all(not io.writes for io in self.bus.axes))
 
     def test_four_legs_complete_two_round_trips_all_axes_same_direction(self):
         """四程应为正、反、正、反，三轴同向，每程只发送一次共同启动帧。"""

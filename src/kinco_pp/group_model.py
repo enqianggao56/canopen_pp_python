@@ -11,11 +11,12 @@ from .model import Motion, Settings, integer, positive
 
 @dataclass(frozen=True)
 class AxisConfig:
-    """单轴名称、设备设置和请求轮廓；位置 inc、速度 rpm、加减速度 rps/s。"""
+    """单轴配置；origin_position_inc 为可选往返固定起点，不修改驱动器坐标零点。"""
 
     name: str
     settings: Settings
     motion: Motion
+    origin_position_inc: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,13 @@ class GroupSettings:
             raise ValueError("轴名称必须非空且互不相同")
         if len({a.settings.node_id for a in self.axes}) != 3:
             raise ValueError("三个轴的节点 ID 必须互不相同")
+        configured_origins = [axis.origin_position_inc is not None for axis in self.axes]
+        if any(configured_origins) and not all(configured_origins):
+            raise ValueError("往返固定起点 origin_position_inc 必须为三个轴同时配置或同时省略")
+        for axis in self.axes:
+            if axis.origin_position_inc is not None:
+                integer(axis.origin_position_inc, axis.settings.min_position_inc,
+                        axis.settings.max_position_inc, f"轴 {axis.name} 固定往返起点")
         buses = {(a.settings.interface, a.settings.channel, a.settings.bitrate) for a in self.axes}
         if len(buses) != 1:
             raise ValueError("三轴必须使用同一 CAN 接口、通道和波特率")
@@ -75,9 +83,10 @@ class GroupSettings:
             row = dict(row)
             name = row.pop("name")
             motion = Motion(**row.pop("motion"))
+            origin = row.pop("origin_position_inc", None)
             settings = Settings(**dict(defaults, **row))
             settings = replace(settings, eds=str((path.parent / settings.eds).resolve()))
-            axes.append(AxisConfig(name, settings, motion))
+            axes.append(AxisConfig(name, settings, motion, origin))
         return cls(axes=tuple(axes), **data)
 
 
