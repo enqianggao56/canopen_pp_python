@@ -13,7 +13,8 @@ from pathlib import Path
 from .controller import DriveError, DriveTimeout
 from .group_model import profile_time
 from .model import integer, positive
-from .objects import (CW_ENABLE, Object, PP_MODE, STATE_ENABLED, STATE_MASK,
+from .objects import (CW_ENABLE, CW_SHUTDOWN, CW_SWITCH_ON, Object, PP_MODE,
+                      STATE_ENABLED, STATE_MASK, STATE_READY, STATE_SWITCHED_ON,
                       SW_FAULT, SW_TARGET_REACHED, INT32_MIN, INT32_MAX)
 
 RS06_COUNTS_PER_REV = 16384
@@ -57,6 +58,7 @@ class RS06Settings:
     zero_velocity_tolerance_rpm: float = 0
     standstill_duration_s: float = 0.1
     sdo_timeout_s: float = 0.3
+    sdo_pause_s: float = 0.005
     state_timeout_s: float = 3
     motion_timeout_s: float = 90
     poll_interval_s: float = 0.02
@@ -89,7 +91,7 @@ class RS06Settings:
         integer(self.target_cob_id, 0x200, 0x57F, 'RS06 目标 RPDO COB-ID')
         for name in ('velocity_rpm', 'acceleration_time_s', 'standstill_duration_s',
                      'sdo_timeout_s', 'state_timeout_s', 'motion_timeout_s',
-                     'poll_interval_s', 'watchdog_timeout_s', 'sync_settle_s'):
+                     'poll_interval_s', 'watchdog_timeout_s', 'sync_settle_s', 'sdo_pause_s'):
             positive(getattr(self, name), name)
         if self.velocity_rpm > 100:
             raise ValueError('本次 RS06 接入速度上限为 100 RPM')
@@ -146,15 +148,18 @@ class RS06Peer:
 
     name = 'rs06/节点4'
 
-    def __init__(self, io, settings, clock=time.monotonic, sleep=time.sleep):
-        """注入整数 SDO 接口、RS06 配置和时钟；构造时无设备操作。"""
+    def __init__(self, io, settings, clock=time.monotonic, sleep=time.sleep,
+                 enter_preoperational=None):
+        """注入SDO、配置、时钟及预操作态回调；实机同步PDO下状态控制也受SYNC门控。"""
         self.io, self.settings, self.clock, self.sleep = io, settings, clock, sleep
+        self.enter_preoperational = enter_preoperational
         self.name = f'rs06/节点{settings.node_id}'
         self.enable_started = False
         self.prepared = False
         self.triggered_at = None
         self.arrived_at = None
         self.complete = False
+        self.arrival_counted = False
         self.target = settings.far_position_inc
         self.velocity_raw = settings.velocity_raw(settings.velocity_rpm)
         self.acceleration_raw = settings.acceleration_raw(
@@ -181,7 +186,7 @@ class RS06Peer:
         if not self.settings.min_position_inc <= position <= self.settings.max_position_inc:
             raise DriveError(f'{self.name} 位置 {position} inc 超出软件范围')
 
-    def plan(self, target, common_duration_s=None):
+    def plan(self, target, common_duration_s=None, start_position_inc=None):
         """为固定端点规划整数轮廓，返回估算秒数；上限为 100 RPM 和配置加速度。
 
         对短恢复段按共同时间缩放轮廓，在相邻整数速度中选模型时间最接近者。
@@ -189,7 +194,8 @@ class RS06Peer:
         """
         if target not in (self.settings.origin_position_inc, self.settings.far_position_inc):
             raise ValueError('RS06 目标必须为已确认固定端点')
-        current = self.check()['start_position_inc']
+        current = self.check()['start_position_inc'] if start_position_inc is None else start_position_inc
+        self._check_position(current)
         self.target = target
         distance = abs(target - current) / RS06_COUNTS_PER_REV
         velocity_cap = self.settings.velocity_raw(self.settings.velocity_rpm)
@@ -261,6 +267,8 @@ class RS06Peer:
         0x6099:01 看门狗按 20000 tick/s 写入且回读，断线时由电机失能。
         """
         self._wait(self._stationary(), self.settings.state_timeout_s, '准备前停稳')
+        if self.enter_preoperational is not None:
+            self.enter_preoperational()
         self.enable_started = True
         self.io.write(Object.CONTROLWORD, RS06_DISABLE)
         self._wait(lambda: self.io.read(Object.STATUSWORD) & STATE_MASK == STATE_SWITCH_ON_DISABLED,
@@ -280,8 +288,25 @@ class RS06Peer:
                       (Object.TARGET_POSITION, current, 0)]
         for index, value, subindex in parameters:
             self.io.write(index, value, subindex)
-            if self.io.read(index, subindex) != value:
-                raise DriveError(f'{self.name} 0x{index:04X}:{subindex:02X} 参数回读不一致')
+            observed = self.io.read(index, subindex)
+            if index == Object.TARGET_POSITION:
+                # 实机失能时0x607A会保持在当前反馈附近，当前坐标本身也有1~2inc抖动。
+                # 此写入仅用于防止使能执行旧远端；检查其仍位于当前位置窗口，
+                # 其余模式、速度、加速度和力矩对象仍要求完全相等。
+                self._check_position(observed)
+                matches = abs(observed - current) <= self.settings.position_tolerance_inc
+            else:
+                matches = observed == value
+            if not matches:
+                raise DriveError(f'{self.name} 0x{index:04X}:{subindex:02X} 参数回读不一致：'
+                                 f'写入={value}，回读={observed}')
+        # 按§5.3使用完整的6→7→15状态序列，逐步确认实际状态。
+        # 同步PDO实机须在NMT预操作态准备，否则SDO控制字也会等待SYNC。
+        for controlword, expected, label in ((CW_SHUTDOWN, STATE_READY, '运行就绪'),
+                                            (CW_SWITCH_ON, STATE_SWITCHED_ON, '主回路就绪')):
+            self.io.write(Object.CONTROLWORD, controlword)
+            self._wait(lambda: self.io.read(Object.STATUSWORD) & STATE_MASK == expected,
+                       self.settings.state_timeout_s, label)
         self.io.write(Object.CONTROLWORD, CW_ENABLE)
         def enabled():
             """实际模式和状态同时确认，故障立即退出。"""
@@ -293,6 +318,7 @@ class RS06Peer:
         self._wait(enabled, self.settings.state_timeout_s, 'PP 使能')
         self._wait(self._stationary(), self.settings.state_timeout_s, '使能后保持')
         self.complete, self.prepared = False, True
+        self.arrival_counted = False
         self.triggered_at, self.arrived_at, self.stable_since = None, None, None
 
     def trigger(self):
@@ -319,23 +345,34 @@ class RS06Peer:
                    and abs(position - self.target) <= self.settings.position_tolerance_inc
                    and velocity <= self.settings.zero_velocity_tolerance_rpm)
         if not reached:
-            if self.complete:
+            if self.arrival_counted and abs(position - self.target) > self.settings.position_tolerance_inc:
                 raise DriveError(f'{self.name} 到位后离开目标窗口')
+            # 位置仍在窗口内的速度反馈尖峰只重新确认稳定窗口，不能冒充位置跑离。
+            self.complete = False
             self.stable_since = None
         elif self.stable_since is None:
             self.stable_since = self.clock()
         elif not self.complete and self.clock() - self.stable_since >= max(
                 self.settings.standstill_duration_s, self.settings.position_window_time_ms / 1000):
             self.complete, self.arrived_at = True, self.clock()
-            self.completed_legs += int(self.has_motion)
-            self.completed_full_legs += int(self.full_stroke)
+            if not self.arrival_counted:
+                self.arrival_counted = True
+                self.completed_legs += int(self.has_motion)
+                self.completed_full_legs += int(self.full_stroke)
         if not self.complete and self.clock() - self.triggered_at >= self.settings.motion_timeout_s:
             raise DriveTimeout(f'{self.name} 等待目标 {self.target} inc 到位超时')
 
     def request_halt(self):
         """按 §5.3 发送控制字11急停；异常仍保留使能尝试标志，供后续确认。"""
         if self.enable_started:
-            self.io.write(Object.CONTROLWORD, RS06_QUICK_STOP)
+            try:
+                if self.enter_preoperational is not None:
+                    # 先关闭同步门控，再发停止字，避免停止也等待SYNC。
+                    # 不发额外SYNC，以免释放尚未确认的残留运动目标。
+                    self.enter_preoperational()
+            finally:
+                # 关闭门控的通信失败也不能跳过最后的厂家停止字请求。
+                self.io.write(Object.CONTROLWORD, RS06_QUICK_STOP)
 
     def wait_halted(self):
         """确认持续低速且位置稳定；不发送失能以冒充停稳，不清除故障。"""
@@ -371,7 +408,11 @@ class SimulatedRS06:
         if index == Object.MODE:
             self.values[Object.MODE_DISPLAY] = value
         elif index == Object.CONTROLWORD:
-            if value == CW_ENABLE:
+            if value == CW_SHUTDOWN:
+                self.values[Object.STATUSWORD] = STATE_READY
+            elif value == CW_SWITCH_ON:
+                self.values[Object.STATUSWORD] = STATE_SWITCHED_ON
+            elif value == CW_ENABLE:
                 self.values[Object.STATUSWORD] = STATE_ENABLED | SW_TARGET_REACHED
             elif value in (RS06_DISABLE, RS06_QUICK_STOP):
                 self.values[Object.STATUSWORD] = (STATE_SWITCH_ON_DISABLED if value == RS06_DISABLE

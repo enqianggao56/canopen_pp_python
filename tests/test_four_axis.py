@@ -8,7 +8,8 @@ from kinco_pp.four_axis_reciprocate import (FourAxisReciprocationRunner,
                                            SimulatedFourAxisBus, main, validate_topology)
 from kinco_pp.group_controller import GroupError
 from kinco_pp.group_model import GroupSettings
-from kinco_pp.objects import CW_HALT, CW_NEW_SETPOINT, Object, SW_FAULT, SW_TARGET_REACHED
+from kinco_pp.objects import (CW_HALT, CW_NEW_SETPOINT, CW_SHUTDOWN, CW_SWITCH_ON,
+                              CW_ENABLE, Object, SW_FAULT, SW_TARGET_REACHED)
 from kinco_pp.reciprocate import RunParameters
 from kinco_pp.rs06 import (RS06Settings, RS06Peer, RS06_QUICK_STOP, SimulatedRS06,
                            TORQUE_LIMIT, WATCHDOG)
@@ -21,6 +22,8 @@ class FourAxisTests(unittest.TestCase):
     def setUp(self):
         """使用600圈三轴与100圈第四轴，均固定从0开始。"""
         self.settings = GroupSettings.load('config/reciprocate.example.json')
+        self.settings = replace(self.settings, axes=tuple(replace(axis,
+            settings=replace(axis.settings, absolute_reference_verified=True)) for axis in self.settings.axes))
         self.rs06 = RS06Settings.load('config/rs06.example.json')
         self.bus = SimulatedFourAxisBus()
         self.clock = Clock()
@@ -49,6 +52,7 @@ class FourAxisTests(unittest.TestCase):
         self.assertEqual(len(report['final_states']), 4)
         self.assertLess(report['four_axis_model_arrival_spread_s'], 0.001)
         self.assertEqual(len(report['four_axis_recent_coordination']), 2)
+        self.assertGreater(report['four_axis_recent_coordination'][-1]['observed_arrival_spread_s'], 0)
         self.assertFalse(report['hardware_validated'])
         self.assertTrue(self.bus.restored)
 
@@ -230,6 +234,85 @@ class FourAxisTests(unittest.TestCase):
         for kwargs in ({'node_id': 1}, {'channel': 'can1'}, {'target_cob_id': 0x500}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 validate_topology(self.settings, replace(self.rs06, **kwargs))
+
+    def test_rs06_firmware_requires_shutdown_switch_on_before_enable(self):
+        """复现实机Revision0x500：直接15不使能，必须完成6→7→15。"""
+        write = self.bus.rs06_io.write
+        previous_control = [None]
+        def strict(index, value, subindex=0):
+            """模拟固件拒绝跳过中间状态，避免测试仅镜像新的发送顺序。"""
+            if index == Object.CONTROLWORD:
+                if value == CW_ENABLE and previous_control[0] != CW_SWITCH_ON:
+                    return
+                if value == CW_SWITCH_ON and previous_control[0] != CW_SHUTDOWN:
+                    return
+                previous_control[0] = value
+            write(index, value, subindex)
+        with patch.object(self.bus.rs06_io, 'write', side_effect=strict):
+            report = self.runner().run()
+        self.assertEqual(report['rs06_completed_round_trips'], 1)
+
+    def test_disabled_rs06_target_can_follow_current_position_with_small_jitter(self):
+        """失能保持目标回读相差2inc时仍能准备，不能把静止反馈抖动当作旧远端。"""
+        read = self.bus.rs06_io.read
+        def jitter(index, subindex=0):
+            """仅使保持目标回读有2inc差异，保留所有其他对象的严格回读。"""
+            value = read(index, subindex)
+            return value + 2 if index == Object.TARGET_POSITION else value
+        with patch.object(self.bus.rs06_io, 'read', side_effect=jitter):
+            self.assertEqual(self.runner().run()['rs06_completed_round_trips'], 1)
+
+    def test_disabled_rs06_stale_target_outside_hold_window_prevents_trigger(self):
+        """旧远端超过当前位置窗口时必须拒绝使能，不把任意回读差异都放行。"""
+        read = self.bus.rs06_io.read
+        def stale(index, subindex=0):
+            """模拟驱动保留了旧目标，偏差大于已配置的位置窗口。"""
+            value = read(index, subindex)
+            return value + self.rs06.position_tolerance_inc + 1 if index == Object.TARGET_POSITION else value
+        with patch.object(self.bus.rs06_io, 'read', side_effect=stale):
+            with self.assertRaisesRegex(Exception, '参数回读不一致'):
+                self.runner().run()
+        self.assertFalse(self.bus.events)
+        self.assertTrue(all(io.values[Object.CONTROLWORD] & CW_HALT for io in self.bus.axes))
+
+    def test_rs06_speed_spike_reconfirms_without_double_counting_arrival(self):
+        """到位位置不变时速度尖峰重启稳定确认，不能误报位置跑离或重复累计单程。"""
+        io = SimulatedRS06()
+        peer = RS06Peer(io, self.rs06, self.clock, self.clock.sleep)
+        peer.prepare()
+        io.write(Object.TARGET_POSITION, peer.target)
+        peer.trigger()
+        for _ in range(100):
+            peer.poll()
+            if peer.complete:
+                break
+            self.clock.sleep(.02)
+        self.assertTrue(peer.complete)
+        self.assertEqual(peer.completed_legs, 1)
+        io.values[Object.ACTUAL_VELOCITY] = 10
+        peer.poll()
+        self.assertFalse(peer.complete)
+        io.values[Object.ACTUAL_VELOCITY] = 0
+        peer.poll()
+        self.clock.sleep(.11)
+        peer.poll()
+        self.assertTrue(peer.complete)
+        self.assertEqual(peer.completed_legs, 1)
+
+    def test_planning_reuses_rs06_snapshot_despite_one_count_jitter(self):
+        """两次静止位置相差1inc不能让最短轮廓自相矛盾，且检查仍不写设备。"""
+        read = self.bus.rs06_io.read
+        samples = [0]
+        def jitter(index, subindex=0):
+            """按1、0交替返回起点，复现旧版先算短时间再按更长距离校验的误报。"""
+            if index == Object.ACTUAL_POSITION:
+                samples[0] += 1
+                return samples[0] % 2
+            return read(index, subindex)
+        with patch.object(self.bus.rs06_io, 'read', side_effect=jitter):
+            checked = self.runner().check()
+        self.assertEqual(checked['rs06']['far_position_inc'], 1638400)
+        self.assertFalse(self.bus.rs06_io.writes)
 
     def test_feedback_stream_contains_four_vendor_correct_speeds(self):
         """CSV和内存采样保持四轴配置顺序，并使用各厂家自己的反馈换算。"""

@@ -53,11 +53,14 @@ class Settings:
     standstill_duration_s: float = 0.05
     hardware_verified: bool = False
     absolute_reference_verified: bool = False
+    actual_position_index: int = 0x6064
 
     def __post_init__(self) -> None:
         """创建时校验类型与范围；无效配置抛出 ValueError。"""
         integer(self.encoder_counts_per_rev, 1, UINT32_MAX, "编码器分辨率")
         integer(self.node_id, 1, 127, "节点 ID")
+        if self.actual_position_index not in (0x6063, 0x6064) or type(self.actual_position_index) is not int:
+            raise ValueError('actual_position_index 必须为0x6063或0x6064；按匹配手册和实机核对')
         integer(self.bitrate, 1, 1000000, "CAN 波特率")
         integer(self.min_position_inc, INT32_MIN, INT32_MAX, "最小位置")
         integer(self.max_position_inc, INT32_MIN, INT32_MAX, "最大位置")

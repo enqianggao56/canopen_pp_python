@@ -1,6 +1,6 @@
 # Kinco CANopen PP Python
 
-使用 Python，通过 CANopen SDO/RPDO 控制 Kinco 伺服电机运行于 PP（Profile Position，轮廓位置）模式。支持单轴、三轴，以及三台 Kinco 加一台 RobStride RS06 的四轴往返，包含中文注释、命令行示例、模拟器及虚拟 CAN 协议测试。四轴扩展尚未完成实机运动验证。
+使用 Python，通过 CANopen SDO/RPDO 控制 Kinco 伺服电机运行于 PP（Profile Position，轮廓位置）模式。支持单轴、三轴，以及三台 Kinco 加一台 RobStride RS06 的四轴往返，包含中文注释、命令行示例、模拟器及虚拟 CAN 协议测试。四轴实机接入与验证范围见[记录](docs/hardware-validation.md)。
 
 当前接入目标为 **iSMD60D-040-DQBK-AA000 + CANable，1 Mbit/s**。已完成软件测试、节点 1 的实机正向 600 圈定位、节点 1/2/3 的三轴小位移定位，以及三轴各 150 圈、速度指令 600 RPM 的实机运行，详见[实机验证记录](docs/hardware-validation.md)。配置和机械运动范围须结合每次实机状态确认。
 
@@ -180,7 +180,7 @@ PYTHONPATH=src:/tmp/kinco-pp-deps python3 -m kinco_pp.reciprocate \
 
 ## 三台 Kinco 加 RS06 四轴往返
 
-独立入口为`python -m kinco_pp.four_axis_reciprocate` / `kinco-pp-four-axis`。默认前三轴节点1/2/3，每程600圈、600 RPM；RS06节点 **0x04，每程100圈、100 RPM**。加减速各2秒，四轴共同时间约62秒，全部到位并停稳后一起换向。持续运行至Ctrl+C，也支持`--duration`限时和`--legs`限制到位段数。
+独立入口为`python -m kinco_pp.four_axis_reciprocate` / `kinco-pp-four-axis`。默认前三轴节点1/2/3，每程600圈、600 RPM；RS06节点 **0x04，每程100圈、100 RPM**。加减速各2秒，完整单程共同时间约62秒，全部到位并停稳后一起换向。四轴均使用已确认的固定绝对端点，不设置零位、不改变原软件限位。持续运行至Ctrl+C，也支持`--duration`限时和`--legs`限制到位段数；恢复段单独计数。
 
 ```bash
 # 模拟完整往返一次，不连接CAN：
@@ -190,24 +190,30 @@ kinco-pp-four-axis --legs 2
 python examples/four_axis_reciprocate.py --legs 2
 ```
 
-前三轴继续使用原往返配置和固定端点，第四轴使用独立的`config/rs06.example.json`。RS06按随附原始`RS06使用说明书260428.pdf` §5.3/§5.4/§5.6和`RS06.eds`实现：一圈16384 inc，100 RPM对应0x6081=1000，两秒加速对应0x6083=500，不使用Kinco的单位或bit12握手。
+四轴的Kinco配置模板为`config/four_axis.kinco.example.json`，与原三轴命令和配置分开；实机沿用原已确认端点。第四轴使用独立的`config/rs06.example.json`。RS06按原始手册§5.3/§5.4/§5.6和EDS实现：一圈16384 inc，100 RPM对应0x6081=1000，两秒加速对应0x6083=500，不使用Kinco单位或bit12握手。四轴模板中Kinco实际位置选择手册的0x6063，RS06仍用0x6064。
 
-四轴同步RPDO分别装载Kinco共享控制字和RS06绝对目标，再用**同一条SYNC释放四轴命令**。按[CANopen SYNC文档](https://canopen.readthedocs.io/en/stable/sync.html)协调消费者；实机内部处理差异仍需验证。默认整数轮廓模型到达时差约0.265 ms，程序另外报告包含通信与到位确认窗口的四轴轮询时差；均不等于实机同步精度。
+四轴同步RPDO分别装载Kinco共享控制字（已核对COB-ID **0x50A**）和RS06绝对目标（0x504），再用**同一条SYNC释放运动命令**。RS06进入运行态后先发初始化SYNC，此时三轴仍Halt且尚未装载运动PDO。触发后立即按设备原周期维持SYNC，本次实机为8 ms。按[CANopen SYNC文档](https://canopen.readthedocs.io/en/stable/sync.html)协调消费者；设备内部响应、确认窗口及主机观测延迟仍需区分。完整单程的整数模型到达时差通常低于1 ms，不能当作实机同步精度。
+
+运动期间Kinco使用经映射核对的TPDO1（状态、实际位置、模式）及临时TPDO2（0x606C速度）反馈，带通信超时检查；避免高频SDO查询与同步TPDO发送竞争。RS06仍按其独立协议监视。配置与停止后通过SDO复核；确认全部停稳后恢复临时映射、禁止时间、SYNC地址和其他原控制PDO。原0x1006周期保持不变，不强制写0。
 
 ```bash
-cp config/rs06.example.json config/local.rs06.json
+cp -n config/rs06.example.json config/local.rs06.json
+# 首次可从四轴模板创建Kinco配置，再填写各轴原已确认端点与限位：
+cp -n config/four_axis.kinco.example.json config/local.four_axis.kinco.json
 # 先配置第四轴已确认的绝对端点与限值，再只读检查，不使能、不发SYNC或运动：
 python -m kinco_pp.four_axis_reciprocate \
-  --config config/local.reciprocate.json --rs06-config config/local.rs06.json --check
+  --config config/local.four_axis.kinco.json --rs06-config config/local.rs06.json --check
 # 完成设备、坐标、力矩、停止方式及同步PDO核对后持续往返：
 python -m kinco_pp.four_axis_reciprocate \
-  --config config/local.reciprocate.json --rs06-config config/local.rs06.json --execute \
+  --config config/local.four_axis.kinco.json --rs06-config config/local.rs06.json --execute \
   --csv /tmp/four-axis-feedback.csv --output /tmp/four-axis-result.json
 ```
 
-RS06模板起点0仅供模拟，不能直接当作实机坐标；固定两端相差1638400 inc才是100圈。默认验证标志均关闭。任一轴异常会请求四轴停止，逐轴确认停稳后恢复临时PDO和SYNC周期；中途恢复段与完整单程分别计数。RS06按厂家手册使用控制字11停止，须核对浪涌电压及负载停止方式；不会套用Kinco的Halt锁轴行为。
+RS06模板起点0仅供模拟；固定两端相差1638400 inc才是100圈。默认实机验证标志关闭，四轴每轴均须确认`absolute_reference_verified`。RS06在准备和停止时先关闭同步门控，再执行厂家状态控制；停止采用控制字11，须核对浪涌电压及负载停止方式，不套用Kinco的Halt锁轴行为。任一轴异常会请求四轴停止，逐轴确认静止后才恢复临时PDO；不扩大原限位。
 
-详细配置、资料差异和验证要求见[四轴接入说明](docs/rs06-four-axis.md)。本次只读实机检查在节点1的SDO身份读取处无应答，未使能或运动，见[接入验证记录](docs/hardware-validation.md#四轴rs06接入的软件验证与只读尝试)。
+详细配置、资料差异、实机接入及测试限制见[四轴接入说明](docs/rs06-four-axis.md)和[验证记录](docs/hardware-validation.md)。中途停止重启先恢复原端点，再按完整行程计数；首次恢复段速度可低于请求上限以协调到达。
+
+本机已实测一次完整四轴往返：三轴各反向600圈再正向600圈，RS06反向100圈再正向100圈，约136.207秒，正常停止。巡航反馈均值约三轴598～601 RPM、RS06 99.2 RPM；四轴到位确认的主机观察时差约0.368/0.399秒，包含RS06稳定确认窗口，不能视为机械同步精度。结束后独立只读检查确认停稳，PDO/SYNC与本次启动前基线一致，详情见[完整往返记录](docs/hardware-validation.md#四轴固定绝对端点完整往返实机验证)。
 
 ## 测试与开发
 

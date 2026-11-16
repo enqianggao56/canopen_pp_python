@@ -34,6 +34,7 @@ class CanopenTransport:
         self.network = network
         self._owns_network = network is None
         self.node = None
+        self.feedback_provider = None
 
     def open(self) -> None:
         """加载 EDS 并连接总线；不发送使能、NMT 启动或运动指令。
@@ -48,6 +49,7 @@ class CanopenTransport:
             # SDO 往返次数固定为一次：响应丢失时不自动重发相对运动触发。
             self.node.sdo.RESPONSE_TIMEOUT = self.settings.sdo_timeout_s
             self.node.sdo.MAX_RETRIES = 1
+            self.node.sdo.PAUSE_BEFORE_SEND = getattr(self.settings, 'sdo_pause_s', 0)
             if self._owns_network:
                 self.network.connect(
                     interface=self.settings.interface, channel=self.settings.channel,
@@ -71,15 +73,23 @@ class CanopenTransport:
 
     def read(self, index: int, subindex: int = 0) -> int:
         """通过 SDO 返回整数原始值；通信、类型或对象错误抛 TransportError。"""
+        if index == Object.ACTUAL_POSITION:
+            # 控制层使用实际位置语义；Kinco手册列6063，RS06列6064，
+            # 必须分别选择已核对坐标/单位的实际对象，不能跨型号硬套索引。
+            index = getattr(self.settings, 'actual_position_index', int(Object.ACTUAL_POSITION))
         try:
             self.network.check()
+            if self.feedback_provider is not None:
+                cached = self.feedback_provider(index, subindex)
+                if cached is not None:
+                    return cached
             value = self._variable(index, subindex).raw
             if not isinstance(value, int):
                 raise ValueError("对象不是整数类型")
             LOG.debug("SDO 读 0x%04X:%02X = %d", index, subindex, value)
             return value
         except Exception as exc:
-            raise TransportError(f"SDO 读 0x{index:04X}:{subindex:02X} 失败：{exc}") from exc
+            raise TransportError(f"节点 {self.settings.node_id} SDO 读 0x{index:04X}:{subindex:02X} 失败：{exc}") from exc
 
     def write(self, index: int, value: int, subindex: int = 0) -> None:
         """以 EDS 类型编码并写入原始值；失败抛 TransportError，不自动重试。"""
@@ -88,7 +98,7 @@ class CanopenTransport:
             LOG.debug("SDO 写 0x%04X:%02X = %d", index, subindex, value)
             self._variable(index, subindex).raw = value
         except Exception as exc:
-            raise TransportError(f"SDO 写 0x{index:04X}:{subindex:02X} 失败：{exc}") from exc
+            raise TransportError(f"节点 {self.settings.node_id} SDO 写 0x{index:04X}:{subindex:02X} 失败：{exc}") from exc
 
     def verify_identity(self) -> dict:
         """核对配置、EDS 和 0x1018 的厂商/产品标识，返回实际身份信息。

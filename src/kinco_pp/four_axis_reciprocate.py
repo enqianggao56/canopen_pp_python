@@ -11,17 +11,22 @@ from dataclasses import replace
 
 from .group_controller import ThreeAxisController
 from .group_model import plan_group, profile_time
-from .group_transport import (CanopenGroupBus, SimulatedGroupBus, PDO_DISABLED, PDO_SYNCHRONOUS)
+from .group_transport import (CanopenGroupBus, SimulatedGroupBus, PDO_DISABLED,
+                              PDO_SYNCHRONOUS, PDO_ASYNCHRONOUS)
 from .objects import CW_HALT, CW_NEW_SETPOINT, Object
 from .reciprocate import ReciprocationRunner
 from .rs06 import RS06Peer, SimulatedRS06, RS06_COUNTS_PER_REV
 from .transport import CanopenTransport, TransportError
+from .pdo_feedback import CyclicFeedback
 
 LOG = logging.getLogger(__name__)
 SYNC_COB_ID = 0x80
 SYNC_COB_OBJECT = 0x1005
 SYNC_PERIOD_OBJECT = 0x1006
 TARGET_POSITION_MAPPING = (int(Object.TARGET_POSITION) << 16) | 32
+# 满速600RPM时10inc约15µs；给绝对位置的再次采样留0.1ms余量，
+# 避免静止1~2inc抖动使严格最短时间校验误报。该余量计入模型，不代表实机精度。
+ABSOLUTE_POSITION_TIME_MARGIN_S = 0.0001
 
 
 def validate_topology(settings, rs06):
@@ -46,11 +51,17 @@ class FourAxisBus(CanopenGroupBus):
         validate_topology(settings, rs06)
         super().__init__(settings)
         self.rs06_settings, self.sleep = rs06, sleep
-        self.transmission_type = PDO_SYNCHRONOUS
+        # 先用异步通道完成SDO状态/定位方式锁存，全部装载后再统一切为同步。
+        self.transmission_type = PDO_ASYNCHRONOUS
         self.rs06_io = None
         self.peer = None
         self._rs_changed = None
         self._sync_changed = []
+        self._other_rpdo_changed = []
+        self._cyclic_sync_active = False
+        self._motion_triggered = False
+        self.sync_period_s = None
+        self.feedback = None
 
     def open(self):
         """连接共享网络，再添加节点4；任何失败释放连接，不发送状态/运动命令。"""
@@ -69,12 +80,14 @@ class FourAxisBus(CanopenGroupBus):
     def check_sync_configuration(self):
         """只读检查四轴 SYNC COB-ID 和 PDO 冲突，返回 RS06 原始映射快照。
 
-        要求 0x1005=0x80（消费者、不自行产生 SYNC）；现场还须确认没有其他
+        要求 Kinco 0x1005=0x80；RS06 允许初始0，运行时临时设为0x80并回读。
+        所有轴必须作为消费者、不自行产生SYNC；现场还须确认没有其他
         SYNC 主站。不能靠 SDO 检查证明总线独占性。
         """
         snapshots = self._snapshot(self.rs06_io)
         for io in self.axes + [self.rs06_io]:
-            if io.read(SYNC_COB_OBJECT) != SYNC_COB_ID:
+            allowed = (0, SYNC_COB_ID) if io is self.rs06_io else (SYNC_COB_ID,)
+            if io.read(SYNC_COB_OBJECT) not in allowed:
                 raise TransportError(f'节点 {io.settings.node_id} 的 0x1005 必须为 0x80 消费者')
             io.read(SYNC_PERIOD_OBJECT)
             for index in io.node.object_dictionary:
@@ -92,28 +105,100 @@ class FourAxisBus(CanopenGroupBus):
         """预先完成全组冲突读取，再配置同步 RPDO；失败保留快照供全组清理恢复。"""
         if not self.rs06_settings.synchronous_pdo_verified:
             raise TransportError('须确认 RS06 同步 RPDO、SYNC 独占及槽位后设置 synchronous_pdo_verified')
-        if self._rs_changed is not None or self._sync_changed:
+        if (self._rs_changed is not None or self._sync_changed or self._other_rpdo_changed
+                or (self.feedback is not None and (self.feedback.changed or self.feedback.subscriptions))):
             raise TransportError('四轴仍有未恢复配置，拒绝重复映射')
         snapshot = self.check_sync_configuration()
+        # 保留的旧RPDO1可能也映射607A/6060/6040。共同SYNC前先暂时禁用
+        # 其他写入这些对象的RPDO，避免多个通道向同一控制对象送入旧过程数据。
+        for io in self.axes + [self.rs06_io]:
+            for index in io.node.object_dictionary:
+                if not 0x1400 <= index <= 0x1407 or index == self.comm_index:
+                    continue
+                cob_id = io.read(index, 1)
+                if cob_id & PDO_DISABLED:
+                    continue
+                mapping_index = index + 0x200
+                count = io.read(mapping_index, 0)
+                mappings = [io.read(mapping_index, sub) for sub in range(1, count+1)]
+                if any(mapping >> 16 in (Object.CONTROLWORD, Object.MODE, Object.TARGET_POSITION)
+                       for mapping in mappings):
+                    transmission = io.read(index, 2)
+                    self._other_rpdo_changed.append((io, index, cob_id, transmission))
+                    io.node.nmt.state = 'PRE-OPERATIONAL'
+                    io.write(index, cob_id | PDO_DISABLED, 1)
+                    io.write(index, PDO_ASYNCHRONOUS, 2)
+                    if io.read(index, 1) != cob_id | PDO_DISABLED:
+                        raise TransportError(f'节点{io.settings.node_id} 其他控制RPDO禁用回读失败')
+                    if io.read(index, 2) != PDO_ASYNCHRONOUS:
+                        raise TransportError(f'节点{io.settings.node_id} 其他控制RPDO关闭同步门控失败')
         super().configure()
         self._rs_changed = snapshot
         self.rs06_io.node.nmt.state = 'PRE-OPERATIONAL'
+        self.sleep(self.rs06_settings.poll_interval_s)
         expected = (self.rs06_settings.target_cob_id, PDO_SYNCHRONOUS, (TARGET_POSITION_MAPPING,))
         self._write_mapping(self.rs06_io, *expected)
         if self._snapshot(self.rs06_io) != expected:
             raise TransportError('RS06 同步目标 RPDO 回读不匹配')
         for io in self.axes + [self.rs06_io]:
-            # 本流程按事件产生 SYNC，不要求原先配置的固定微秒周期。
+            # 保留实机现有SYNC周期。Kinco当前固件不接受1006=0，不能
+            # 通过忽略回读差异来继续；PP共同触发只改变RPDO类型和必要的SYNC地址。
             original = io.read(SYNC_PERIOD_OBJECT)
-            self._sync_changed.append((io, original))
-            io.write(SYNC_PERIOD_OBJECT, 0)
-            if io.read(SYNC_PERIOD_OBJECT) != 0:
-                raise TransportError(f'节点 {io.settings.node_id} SYNC 周期回读不匹配')
+            original_cob_id = io.read(SYNC_COB_OBJECT)
+            self._sync_changed.append((io, original, original_cob_id))
+            if original_cob_id != SYNC_COB_ID:
+                io.write(SYNC_COB_OBJECT, SYNC_COB_ID)
+                if io.read(SYNC_COB_OBJECT) != SYNC_COB_ID:
+                    raise TransportError(f'节点 {io.settings.node_id} SYNC地址回读不匹配')
+        self.feedback = CyclicFeedback(self.network, self.axes, self.axes+[self.rs06_io],
+                                       self.settings, lambda: self._cyclic_sync_active)
+        self.feedback.configure()
 
     def start_all(self):
-        """四节点 NMT 启动；此时尚未释放新目标，不作为运动触发。"""
+        """启动Kinco；RS06保持预操作态完成SDO准备，到共同触发前才切入运行态。"""
         super().start_all()
+
+    def rs06_preoperational(self):
+        """进入预操作态并关闭RS06同步门控，使SDO状态控制立即生效。
+
+        实机即使在NMT预操作态，传输类型1仍会让SDO控制字等待SYNC。
+        因此先禁用目标RPDO，再改回异步254；不恢复原映射、不发SYNC或位置目标。
+        仅在共同启动前重启同步映射，停止时保持通道禁用至确认全组静止。
+        """
+        self.rs06_io.node.nmt.state = 'PRE-OPERATIONAL'
+        self.sleep(self.rs06_settings.poll_interval_s)
+        cob_id = self.rs06_io.read(self.comm_index, 1)
+        self.rs06_io.write(self.comm_index, cob_id | PDO_DISABLED, 1)
+        self.rs06_io.write(self.comm_index, PDO_ASYNCHRONOUS, 2)
+        self.sleep(self.rs06_settings.poll_interval_s)
+        if self.rs06_io.read(self.comm_index, 2) != PDO_ASYNCHRONOUS:
+            raise TransportError('RS06停止/准备时关闭同步门控回读失败')
+
+    def _start_rs06(self):
+        """RS06已在预操作态使能并保持当前位置后，切入运行态接收同步目标。"""
+        expected = (self.rs06_settings.target_cob_id, PDO_SYNCHRONOUS, (TARGET_POSITION_MAPPING,))
+        self._write_mapping(self.rs06_io, *expected)
+        if self._snapshot(self.rs06_io) != expected:
+            raise TransportError('RS06共同触发前同步映射回读失败')
         self.rs06_io.start()
+        self.sleep(self.rs06_settings.poll_interval_s)
+        # 当前Revision0x500实机进入OP后需先收到一条初始化SYNC，
+        # 才接收后续同步RPDO。此时Kinco仍为Halt，尚未发送任何新目标帧。
+        self._send(SYNC_COB_ID, b'')
+        self.sleep(self.rs06_settings.poll_interval_s)
+
+    def _arm_kinco_sync(self, controlword):
+        """三轴定位方式及目标已在异步准备阶段锁存后，切为同一同步控制字通道。"""
+        # 先通过同一RPDO让实际过程控制字锁存定位方式和Halt；不置bit4。
+        # 当前实机SDO与PDO控制字缓存不同，不能仅用SDO回读推断PDO已采用相对方式。
+        CanopenGroupBus.broadcast(self, (controlword & ~CW_NEW_SETPOINT) | CW_HALT)
+        self.sleep(self.rs06_settings.poll_interval_s)
+        expected = (self.settings.shared_cob_id, PDO_SYNCHRONOUS,
+                    ((int(Object.CONTROLWORD) << 16) | 16,))
+        for io in self.axes:
+            self._write_mapping(io, *expected)
+            if self._snapshot(io) != expected:
+                raise TransportError(f'节点{io.settings.node_id} 触发前同步映射回读失败')
 
     def _send(self, cob_id, data):
         """发送有界等待的标准帧；不重试目标或 SYNC，以免重复不确定命令。"""
@@ -125,6 +210,20 @@ class FourAxisBus(CanopenGroupBus):
         with self.network.send_lock:
             self.network.bus.send(message, timeout=timeout)
 
+    def _stop_cyclic_sync(self):
+        """停止周期SYNC，防止停止/重新装载阶段有后台SYNC抢先释放目标。"""
+        if self._cyclic_sync_active:
+            self.network.sync.stop()
+            self._cyclic_sync_active = False
+
+    def _start_cyclic_sync(self):
+        """新目标已共同触发后立即按设备原周期维持同步通信，覆盖PP应答阶段。"""
+        if not self._cyclic_sync_active:
+            periods = [period / 1000000 for _, period, _ in self._sync_changed if period > 0]
+            self.sync_period_s = min(periods) if periods else self.rs06_settings.poll_interval_s
+            self.network.sync.start(self.sync_period_s)
+            self._cyclic_sync_active = True
+
     def broadcast(self, controlword):
         """装载两种命令后统一 SYNC；停止时先停止 RS06，避免释放残留待处理目标。
 
@@ -135,11 +234,15 @@ class FourAxisBus(CanopenGroupBus):
             raise TransportError('RS06 伴随控制器尚未绑定')
         stop_error = None
         if controlword & CW_HALT:
+            self._stop_cyclic_sync()
+            self._motion_triggered = False
             try:
                 self.peer.request_halt()
             except Exception as exc:
                 stop_error = exc
         elif controlword & CW_NEW_SETPOINT:
+            self._arm_kinco_sync(controlword)
+            self._start_rs06()
             self._send(self.rs06_settings.target_cob_id, self.peer.target.to_bytes(4, 'little', signed=True))
         super().broadcast(controlword)
         if stop_error is not None:
@@ -148,9 +251,18 @@ class FourAxisBus(CanopenGroupBus):
             raise TransportError(f'RS06 停止请求失败，未发送 SYNC：{stop_error}') from stop_error
         self.sleep(self.rs06_settings.sync_settle_s)
         self._send(SYNC_COB_ID, b'')
+        if controlword & CW_NEW_SETPOINT:
+            self._motion_triggered = True
+            # 首轮反馈/应答读取也需要周期SYNC，不能等应答复位后才启动。
+            # 只重复SYNC，不重发运动PDO，因此没有新的bit4上升沿。
+            self._start_cyclic_sync()
+        elif not controlword & CW_HALT and self._motion_triggered:
+            # 按Kinco手册§9.3.3.3维持周期SYNC；不重发bit4上升沿或运动PDO。
+            self._start_cyclic_sync()
 
     def restore(self):
         """仅由全组确认停稳后的调用方进入；逐项恢复，失败不跳过其余配置。"""
+        self._stop_cyclic_sync()
         errors = []
         try:
             super().restore()
@@ -167,17 +279,45 @@ class FourAxisBus(CanopenGroupBus):
             except Exception as exc:
                 errors.append(f'RS06 映射恢复：{exc}')
         failed = []
-        for io, original in self._sync_changed:
+        for io, original, original_cob_id in self._sync_changed:
             try:
-                io.write(SYNC_PERIOD_OBJECT, original)
+                if io.read(SYNC_PERIOD_OBJECT) != original:
+                    io.write(SYNC_PERIOD_OBJECT, original)
                 if io.read(SYNC_PERIOD_OBJECT) != original:
                     raise TransportError('回读不匹配')
+                if io.read(SYNC_COB_OBJECT) != original_cob_id:
+                    io.write(SYNC_COB_OBJECT, original_cob_id)
+                if io.read(SYNC_COB_OBJECT) != original_cob_id:
+                    raise TransportError('SYNC地址恢复回读不匹配')
             except Exception as exc:
-                failed.append((io, original))
+                failed.append((io, original, original_cob_id))
                 errors.append(f'节点{io.settings.node_id} SYNC周期恢复：{exc}')
         self._sync_changed = failed
+        failed_other = []
+        for io, index, cob_id, transmission in self._other_rpdo_changed:
+            try:
+                io.write(index, transmission, 2)
+                io.write(index, cob_id, 1)
+                if io.read(index, 1) != cob_id or io.read(index, 2) != transmission:
+                    raise TransportError('原COB-ID回读不匹配')
+            except Exception as exc:
+                failed_other.append((io, index, cob_id, transmission))
+                errors.append(f'节点{io.settings.node_id} 其他RPDO恢复：{exc}')
+        self._other_rpdo_changed = failed_other
+        if self.feedback is not None:
+            try:
+                self.feedback.restore()
+            except Exception as exc:
+                errors.append(str(exc))
         if errors:
             raise TransportError('四轴配置恢复失败：' + '; '.join(errors))
+
+    def close(self):
+        """释放连接前停止后台SYNC；驱动器停止仍由控制器负责。"""
+        self._stop_cyclic_sync()
+        if self.feedback is not None:
+            self.feedback.detach()
+        super().close()
 
 
 class SimulatedFourAxisBus(SimulatedGroupBus):
@@ -205,10 +345,11 @@ class FourAxisController(ThreeAxisController):
 
     def run(self):
         """正常完成时返回原三轴结果，并记录包含 RS06 到位确认的主机观察时差。"""
+        starts = tuple(io.read(Object.ACTUAL_POSITION) for io in self.bus.axes)
         result = super().run()
         peer = self.peers[0]
-        arrivals = [arrival for arrival, axis in zip(result.observed_arrival_times_s, result.plan.axes)
-                    if axis.motion.target_inc != 0]
+        arrivals = [arrival for arrival, axis, start in zip(result.observed_arrival_times_s, result.plan.axes, starts)
+                    if abs(axis.end_inc-start) > axis.axis.settings.position_tolerance_inc]
         if peer.has_motion:
             arrivals.append(peer.arrived_at)
         self.four_axis_observed_spread_s = max(arrivals) - min(arrivals) if arrivals else 0.0
@@ -222,7 +363,8 @@ class FourAxisReciprocationRunner(ReciprocationRunner):
                  clock=time.monotonic, sleep=time.sleep, sample_sink=None):
         """复用原三轴计数/端点逻辑；第四轴保留独立恢复段与完整单程计数。"""
         validate_topology(settings, rs06)
-        self.peer = RS06Peer(bus.rs06_io, rs06, clock, sleep)
+        self.peer = RS06Peer(bus.rs06_io, rs06, clock, sleep,
+                            enter_preoperational=getattr(bus, 'rs06_preoperational', None))
         bus.peer = self.peer
         self.coordination = []
         self.last_controller = None
@@ -257,16 +399,29 @@ class FourAxisReciprocationRunner(ReciprocationRunner):
         if starts is None:
             starts = tuple(io.read(Object.ACTUAL_POSITION) for io in self.bus.axes)
         settings = super()._leg_settings(endpoints, starts)
+        # 四轴实机以原已确认编码器坐标直接指定固定端点。同步RPDO下相对
+        # 指令接管暂停旧轨迹的行为未通过实测，不能继续依赖相对方式推断终点。
+        # 不更改零位、原端点或限位；真实配置须明确确认绝对坐标有效。
+        settings = replace(settings, axes=tuple(replace(axis,
+            motion=replace(axis.motion, target_inc=endpoint, relative=False))
+            for axis, endpoint in zip(settings.axes, endpoints)))
+        for axis, start in zip(settings.axes, starts):
+            axis.motion.validate(axis.settings, start)
         first = self.settings.axes[0]
         far = first.origin_position_inc + round(self.parameters.turns * first.settings.encoder_counts_per_rev)
         forward = endpoints[0] == far
         target = self.peer.settings.far_position_inc if forward else self.peer.settings.origin_position_inc
-        rs_minimum = self.peer.plan(target)
+        # 同一次规划复用同一位置快照，避免静止1~2inc抖动使两次读取的
+        # 最短时间互相矛盾，误报共同时间过短。
+        rs_start = self.peer.check()['start_position_inc']
+        rs_minimum = self.peer.plan(target, start_position_inc=rs_start)
         kinco_minimum = plan_group(settings, starts).duration_s
         common = max(rs_minimum, kinco_minimum)
+        if common:
+            common += ABSOLUTE_POSITION_TIME_MARGIN_S
         settings = replace(settings, duration_s=common if common else None)
         plan = plan_group(settings, starts)
-        rs_duration = self.peer.plan(target, common)
+        rs_duration = self.peer.plan(target, common, start_position_inc=rs_start)
         moving = [axis.estimated_duration_s for axis, start in zip(plan.axes, starts) if axis.end_inc != start]
         if rs_duration:
             moving.append(rs_duration)
@@ -316,7 +471,8 @@ class FourAxisReciprocationRunner(ReciprocationRunner):
 def main(argv=None):
     """独立四轴入口；--rs06-config 可覆盖第四轴配置，其余参数沿用三轴往返入口。"""
     from .reciprocate import main as reciprocate_main
-    return reciprocate_main(['--rs06-config', 'config/rs06.example.json']
+    return reciprocate_main(['--config', 'config/four_axis.kinco.example.json',
+                            '--rs06-config', 'config/rs06.example.json']
                             + list(sys.argv[1:] if argv is None else argv))
 
 

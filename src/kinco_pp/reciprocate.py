@@ -287,9 +287,17 @@ def main(argv=None):
                                                 SimulatedFourAxisBus, validate_topology)
             rs06 = RS06Settings.load(args.rs06_config)
             validate_topology(settings, rs06)
+            if not args.execute and not args.check:
+                # 模拟器坐标由本地初始化确定，仅在纯模拟时建立绝对坐标确认。
+                # 实机执行和只读检查均保留用户配置的确认标志。
+                settings = replace(settings, axes=tuple(replace(axis,
+                    settings=replace(axis.settings, absolute_reference_verified=True))
+                    for axis in settings.axes))
             if args.execute and not (rs06.hardware_verified and rs06.absolute_reference_verified
                                      and rs06.synchronous_pdo_verified):
                 raise ValueError('RS06 实机运行前须核对 hardware_verified、absolute_reference_verified、synchronous_pdo_verified')
+            if args.execute and not all(axis.settings.absolute_reference_verified for axis in settings.axes):
+                raise ValueError('四轴固定绝对端点运行前须逐轴确认Kinco absolute_reference_verified')
         if args.execute and (not settings.pdo_configuration_verified
                 or not all(a.settings.hardware_verified for a in settings.axes)):
             raise ValueError('实机运行前必须核对所有 hardware_verified 和 pdo_configuration_verified')

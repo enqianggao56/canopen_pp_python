@@ -12,6 +12,7 @@ class Object(IntEnum):
     HALT_OPTION = 0x605D
     MODE = 0x6060
     MODE_DISPLAY = 0x6061
+    # 实际位置的默认语义索引；Kinco可通过actual_position_index选手册6063，RS06用6064。
     ACTUAL_POSITION = 0x6064
     ACTUAL_VELOCITY = 0x606C
     TARGET_POSITION = 0x607A
